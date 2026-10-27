@@ -342,3 +342,34 @@ test('Actions queue webhook is off without a secret', async () => {
     assert.deepEqual((await (await w.req('/api/ci/queue')).json()).configured, { webhook: false, sweep: null });
   } finally { w.close(); }
 });
+
+test('Actions queue: private changes are announced to members only', async () => {
+  const w = await start(9920871, [], { ciQueue: { secret: 'hook-secret' } });
+  const streams = [];
+  try {
+    const send = (id, priv) => {
+      const body = JSON.stringify({ action: 'queued', organization: { login: 'dashpay' }, repository: { full_name: priv ? 'dashpay/hotfix' : 'dashpay/dash', private: priv },
+        workflow_job: { id, run_id: id, status: 'queued', name: 'lint', workflow_name: 'CI', labels: ['x'], created_at: new Date().toISOString() } });
+      return w.req('/api/ci/github-webhook', { method: 'POST', body, headers: { 'content-type': 'application/json', 'x-github-event': 'workflow_job', 'x-hub-signature-256': `sha256=${createHmac('sha256', 'hook-secret').update(body).digest('hex')}` } });
+    };
+    // Collects the event types one stream receives.
+    const listen = async (cookie) => {
+      const ctl = new AbortController();
+      const r = await w.req('/api/stream', { headers: cookie ? {} : { cookie: '' }, signal: ctl.signal });
+      const seen = [];
+      (async () => { try { for await (const chunk of r.body) for (const m of String(Buffer.from(chunk)).matchAll(/^event: (\S+)/gm)) seen.push(m[1]); } catch { /* aborted */ } })();
+      streams.push(ctl);
+      return seen;
+    };
+    const anon = await listen(false);
+    await w.login();
+    const member = await listen(true);
+    const settle = () => new Promise((r) => setTimeout(r, 1300)); // notices are debounced by 1 s
+    await send(1, true);
+    await settle();
+    assert.deepEqual([member.includes('ci-queue'), anon.includes('ci-queue')], [true, false]);
+    await send(2, false);
+    await settle();
+    assert.equal(anon.includes('ci-queue'), true);
+  } finally { for (const s of streams) s.abort(); w.close(); }
+});

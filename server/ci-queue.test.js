@@ -290,15 +290,17 @@ test('runner wait never includes a hold, whatever order GitHub reports it in', (
   assert.equal(q.summary({ full: true }).waiting.map((j) => j.id).includes(1), true);
   // Held, then running with no queued seen: the queue time is unknown and left out.
   send(2, 'pending');
-  // First seen already running: its hold is unknown too.
   now += 60_000;
   send(1, 'in_progress', { started_at: iso(now) });
   send(2, 'in_progress', { started_at: iso(now) });
-  send(3, 'in_progress', { started_at: iso(now) });
-  for (const id of [1, 2, 3]) send(id, 'completed', { started_at: iso(now), completed_at: iso(now + 60_000) });
+  // First seen running, no hold seen: counted from creation (30 s)…
+  send(3, 'in_progress', { created_at: iso(now - 30_000), started_at: iso(now) });
+  // …unless that is over 24 h, which only a hold explains.
+  send(4, 'in_progress', { created_at: iso(now - 48 * 3_600_000), started_at: iso(now) });
+  for (const id of [1, 2, 3, 4]) send(id, 'completed', { started_at: iso(now), completed_at: iso(now + 60_000), ...(id === 3 ? { created_at: iso(now - 30_000) } : id === 4 ? { created_at: iso(now - 48 * 3_600_000) } : {}) });
   const s = q.summary({ full: true });
-  assert.equal(s.totals.finished24h, 3);
-  assert.equal(s.totals.medianWaitSec24h, 60, 'only job 1, queued for one minute after a 3 h approval');
+  assert.equal(s.totals.finished24h, 4);
+  assert.equal(s.totals.medianWaitSec24h, 30, 'job 3 (30 s) and job 1 (60 s after a 3 h approval); jobs 2 and 4 left out');
   assert.equal(s.totals.p90WaitSec24h, 60);
 });
 

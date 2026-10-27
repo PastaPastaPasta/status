@@ -151,8 +151,9 @@ requests/h). Data is kept in `data/ci/` for 30 days.
 for a runner or running, on GitHub-hosted and self-hosted runners alike. Jobs held
 before they ask for a runner (an environment approval, or a concurrency group) are
 counted and listed apart, since they say nothing about runner capacity. Runner wait
-is measured from when a job was seen queued after any such hold; jobs first seen
-already running are left out of the wait statistics, since their hold is unknown. Jobs are grouped by
+is measured from when a job was seen queued after any such hold. A job first seen
+already running is timed from its creation (a hold the server never saw would count
+as wait), unless that exceeds 24 h; a job seen held and then running is left out. Jobs are grouped by
 their `runs-on` labels, with the wait so far, the 24 h median and p90 wait, and when
 a runner last took that label set. A job with no update for 2 hours (no webhook
 event and no sweep that could read it) is marked unverified, and dropped only once

@@ -72,16 +72,19 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
   }
 
   // Deliveries can arrive out of order: a job never moves back to an earlier state.
-  // queuedAt: when it began waiting for a runner, after any concurrency or approval hold; null
-  // when unknown (a hold, or nothing, was seen before it started), so it stays out of wait statistics.
+  // queuedAt: when it began waiting for a runner, after any concurrency or approval hold. A job first
+  // seen already running with no hold seen is counted from creation, unless that is over 24 h (no
+  // queue wait is that long, so a hold was in it). After a hold with no `queued` seen it is unknown
+  // (null) and stays out of the wait statistics.
   function apply(job, seenAt) {
     const key = String(job.id);
     const prior = st.jobs[key];
     if (prior && RANK[prior.status] > RANK[job.status]) return false;
     if (st.done.some((d) => d.id === job.id)) return false;
     const wasHeld = HELD.has(job.status) || !!prior?.wasHeld;
+    const fromCreation = job.createdAt && job.startedAt && Date.parse(job.startedAt) - Date.parse(job.createdAt) <= DAY ? job.createdAt : null;
     const queuedAt = HELD.has(job.status) ? null
-      : prior?.queuedAt || (RANK[job.status] >= 1 ? null : wasHeld ? seenAt : job.createdAt || seenAt);
+      : prior?.queuedAt || (RANK[job.status] < 1 ? (wasHeld ? seenAt : job.createdAt || seenAt) : wasHeld ? null : fromCreation);
     if (job.startedAt && job.runnerGroup) {
       const k = labelKey(job.labels), s = { at: job.startedAt, hosted: job.runnerGroup === 'GitHub Actions' };
       st.served[k] = { ...st.served[k], all: s, ...(job.private ? {} : { pub: s }) };
