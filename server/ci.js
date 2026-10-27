@@ -296,7 +296,8 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
         });
       }
       for (const p of h.pools || []) {
-        const mine = jobs.filter((j) => j.host === h.id && j.pool === p.name);
+        // One reporter may read several controllers: a job belongs to the one its runner name says.
+        const mine = jobs.filter((j) => j.host === h.id && j.pool === p.name && (!p.controller || String(j.runnerName).startsWith(`${p.controller}-${p.name}-`)));
         // Jobs shorter than a report interval only show up in the ledger, so busy time comes from it.
         const busyIn = (a, b) => mine.reduce((s, j) => s + (j.end ? overlap(Date.parse(j.start), Date.parse(j.end), a, b) : 0), 0);
         const size = p.size || 0, count = (k) => (stale ? 0 : p[k] || 0);

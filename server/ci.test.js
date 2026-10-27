@@ -137,6 +137,10 @@ test('dash-ci-pool hosts: pools count as capacity, single-use runner jobs are ti
   assert.deepEqual([drained.pools[0].status, drained.totals.runners, drained.totals.online], ['draining', 1, 1]);
   ci.ingest(id, { ...report(), runners: [], pools: [pool] });
   assert.deepEqual([p.day.jobs, p.day.failed, p.day.busySec], [2, 1, 60]);
+  // A second controller's light pool on the same reporter keeps its own jobs.
+  ci.ingest(id, { ...report(), runners: [], pools: [pool, { ...pool, controller: 'other' }] });
+  assert.deepEqual(ci.summary().pools.map((x) => x.day.jobs), [2, 0]);
+  ci.ingest(id, { ...report(), runners: [], pools: [pool] });
   assert.equal(p.hours.length, 48);
   assert.deepEqual([s.totals.runners, s.totals.online, s.totals.busy, s.totals.jobs24h], [4, 3, 1, 2]);
   // The runner is gone, but its job is matched on GitHub by the name it ran under.

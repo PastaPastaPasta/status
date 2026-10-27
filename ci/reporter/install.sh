@@ -27,7 +27,8 @@ if [ -n "${DASH_CI_TOKEN:-}" ]; then
 fi
 [ -f "$home/config.json" ] || { echo "no $home/config.json; set DASH_CI_TOKEN and DASH_CI_RUNNERS or DASH_CI_POOLS" >&2; exit 1; }
 
+# Check the config before the cron entry goes in.
+"$python" -c 'import json,sys; c=json.load(open(sys.argv[1])); p=c.get("pools", []); assert c["token"] and (c.get("runners") or p) and isinstance(p, list) and all(isinstance(d, str) and d for d in p), "pools must be a list of directories"' "$home/config.json"
 line="* * * * * $python $home/dash-ci-reporter.py >/dev/null 2>&1 # dash-ci-reporter"
 ( crontab -l 2>/dev/null | grep -v '# dash-ci-reporter$' || true; echo "$line" ) | crontab -
-"$python" -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["token"] and (c.get("runners") or c.get("pools"))' "$home/config.json"
 echo "dash-ci-reporter installed: $line"
