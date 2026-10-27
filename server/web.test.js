@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createWeb } from './web.js';
 import { DEFAULT_SETTINGS } from '../shared/settings.js';
 
-async function start(userId = 9920871, extraUsers = []) {
+async function start(userId = 9920871, extraUsers = [], options = {}) {
   const dataDir = mkdtempSync(join(tmpdir(), 'web-'));
   mkdirSync(join(dataDir, 'state'), { recursive: true });
   writeFileSync(join(dataDir, 'state', 'testnet.json'), JSON.stringify({ generatedAt: new Date().toISOString(), hosts: [
@@ -17,7 +18,7 @@ async function start(userId = 9920871, extraUsers = []) {
     : url.includes('/users/octocat') ? Response.json({ id: 583231, login: 'octocat', name: 'The Octocat', type: 'User', avatar_url: 'https://avatars.githubusercontent.com/u/583231' })
       : url.includes('/users/') ? new Response('{}', { status: 404 }) : Response.json({ id: userId, login: 'someone' });
   const origin = 'http://127.0.0.1';
-  const app = createWeb({ dataDir, origin, mainnetReportToken: 'fixture-mainnet-token', auth: { clientId: 'c', clientSecret: 's', fetcher: github }, fetcher: github });
+  const app = createWeb({ dataDir, origin, mainnetReportToken: 'fixture-mainnet-token', auth: { clientId: 'c', clientSecret: 's', fetcher: github }, fetcher: github, ...options });
   const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
   const base = `http://127.0.0.1:${server.address().port}`;
   let cookie = '';
@@ -306,4 +307,69 @@ test('remediation board is read-only and its notes require administrator access'
     assert.equal(full.public, false); assert.equal(full.cases[0].summary, 'PRIVATE-NOTE');
     assert.equal(full.cases[0].stage, 'blocked');
   } finally { w.close(); }
+});
+
+test('Actions queue: signed org webhook in, public and member views out', async () => {
+  const w = await start(9920871, [], { ciQueue: { secret: 'hook-secret' } });
+  try {
+    const send = (event, payload, secret = 'hook-secret') => {
+      const body = JSON.stringify(payload);
+      return w.req('/api/ci/github-webhook', { method: 'POST', body, headers: { 'content-type': 'application/json', 'x-github-event': event,
+        'x-hub-signature-256': `sha256=${createHmac('sha256', secret).update(body).digest('hex')}` } });
+    };
+    const job = (id, name, priv) => ({ action: 'queued', organization: { login: 'dashpay' }, repository: { full_name: name, private: priv },
+      workflow_job: { id, run_id: id, status: 'queued', name: 'lint', workflow_name: 'CI', labels: ['dash-x64-light'], created_at: new Date().toISOString(), head_branch: 'feat/a' } });
+    assert.equal((await send('ping', { zen: 'hi' })).status, 200);
+    assert.equal((await send('workflow_job', job(1, 'dashpay/dash', false), 'wrong')).status, 401);
+    assert.equal((await send('workflow_job', job(1, 'dashpay/dash', false))).status, 200);
+    assert.equal((await send('workflow_job', job(2, 'dashpay/hotfix', true))).status, 200);
+    assert.equal((await send('workflow_run', { action: 'requested' })).status, 202);
+    const pub = await (await w.req('/api/ci/queue')).json();
+    assert.equal(pub.public, true);
+    assert.deepEqual(pub.waiting.map((j) => j.repo), ['dashpay/dash']);
+    assert.equal(pub.waiting[0].branch, undefined);
+    await w.login();
+    const full = await (await w.req('/api/ci/queue')).json();
+    assert.equal(full.public, false);
+    assert.deepEqual(full.waiting.map((j) => j.repo).sort(), ['dashpay/dash', 'dashpay/hotfix']);
+  } finally { w.close(); }
+});
+
+test('Actions queue webhook is off without a secret', async () => {
+  const w = await start();
+  try {
+    assert.equal((await w.req('/api/ci/github-webhook', { method: 'POST', body: '{}', headers: { 'content-type': 'application/json', 'x-github-event': 'ping' } })).status, 404);
+    assert.deepEqual((await (await w.req('/api/ci/queue')).json()).configured, { webhook: false, sweep: null });
+  } finally { w.close(); }
+});
+
+test('Actions queue: private changes are announced to members only', async () => {
+  const w = await start(9920871, [], { ciQueue: { secret: 'hook-secret' } });
+  const streams = [];
+  try {
+    const send = (id, priv) => {
+      const body = JSON.stringify({ action: 'queued', organization: { login: 'dashpay' }, repository: { full_name: priv ? 'dashpay/hotfix' : 'dashpay/dash', private: priv },
+        workflow_job: { id, run_id: id, status: 'queued', name: 'lint', workflow_name: 'CI', labels: ['x'], created_at: new Date().toISOString() } });
+      return w.req('/api/ci/github-webhook', { method: 'POST', body, headers: { 'content-type': 'application/json', 'x-github-event': 'workflow_job', 'x-hub-signature-256': `sha256=${createHmac('sha256', 'hook-secret').update(body).digest('hex')}` } });
+    };
+    // Collects the event types one stream receives.
+    const listen = async (cookie) => {
+      const ctl = new AbortController();
+      const r = await w.req('/api/stream', { headers: cookie ? {} : { cookie: '' }, signal: ctl.signal });
+      const seen = [];
+      (async () => { try { for await (const chunk of r.body) for (const m of String(Buffer.from(chunk)).matchAll(/^event: (\S+)/gm)) seen.push(m[1]); } catch { /* aborted */ } })();
+      streams.push(ctl);
+      return seen;
+    };
+    const anon = await listen(false);
+    await w.login();
+    const member = await listen(true);
+    const settle = () => new Promise((r) => setTimeout(r, 1300)); // notices are debounced by 1 s
+    await send(1, true);
+    await settle();
+    assert.deepEqual([member.includes('ci-queue'), anon.includes('ci-queue')], [true, false]);
+    await send(2, false);
+    await settle();
+    assert.equal(anon.includes('ci-queue'), true);
+  } finally { for (const s of streams) s.abort(); w.close(); }
 });

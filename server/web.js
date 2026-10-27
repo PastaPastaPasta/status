@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAuth } from './auth.js';
 import { createCi } from './ci.js';
+import { createOrgQueue } from './ci-queue.js';
 import { operationMaintenance } from './operation-maintenance.js';
 import { loadIncidentState, publicIssues, apiAuthorized, readSecret } from './incidents.js';
 import { remediationView } from './remediation.js';
@@ -24,7 +25,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 
 const LIFECYCLE_ACTIONS = ['create-devnet', 'delete-devnet', 'devnet-services', 'devnet-platform', 'platform-reset'];
 
-export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, clock = Date.now, ciGithub = null, mainnetReportToken = process.env.MAINNET_REPORT_TOKEN } = {}) {
+export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, clock = Date.now, ciGithub = null, ciQueue = {}, mainnetReportToken = process.env.MAINNET_REPORT_TOKEN } = {}) {
   const settingsPath = join(dataDir, 'settings.json');
   const dirs = { state: join(dataDir, 'state'), requests: join(dataDir, 'requests'), ops: join(dataDir, 'ops') };
   for (const d of Object.values(dirs)) mkdirSync(d, { recursive: true });
@@ -35,12 +36,28 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
   const clients = new Set();
   const cache = new Map();
   const ci = createCi({ dataDir, fetcher, clock, github: ciGithub, log: (...a) => console.log(new Date(clock()).toISOString(), ...a) });
+  const orgQueue = createOrgQueue({ dataDir, fetcher, clock, github: ciGithub, ...ciQueue, log: (...a) => console.log(new Date(clock()).toISOString(), ...a) });
   const awsDir = join(dataDir, 'aws');
   mkdirSync(awsDir, { recursive: true });
 
   // nginx on the host reaches the container through the Docker bridge gateway.
   app.set('trust proxy', ['loopback', 'uniquelocal']);
   app.use(helmet({ contentSecurityPolicy: { directives: { 'style-src': ["'self'", "'unsafe-inline'"], 'img-src': ["'self'", 'data:', 'https://avatars.githubusercontent.com'] } } }));
+  // GitHub org webhook (workflow_job events) for the Actions queue. The HMAC
+  // covers the exact bytes GitHub sent, so this reads the raw body. It sits
+  // before the /api rate limit, with a much higher one of its own: GitHub sends
+  // bursts from a few addresses and does not retry; the signature is the gate.
+  app.post('/api/ci/github-webhook', rateLimit({ windowMs: 60_000, limit: 6000, standardHeaders: true, legacyHeaders: false }), (req, res, next) => (orgQueue.configured() ? next() : res.status(404).json({ error: 'Actions queue webhook is not configured' })),
+    express.raw({ type: () => true, limit: '512kb' }), (req, res) => {
+    if (!orgQueue.verify(req.body, req.get('x-hub-signature-256'))) return res.status(401).json({ error: 'bad signature' });
+    const event = req.get('x-github-event');
+    if (event === 'ping') return res.json({ ok: true });
+    try {
+      const scope = orgQueue.webhook(event, JSON.parse(req.body.toString('utf8')));
+      pushQueue(scope);
+      res.status(scope ? 200 : 202).json({ ok: true });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+  });
   app.use('/api', rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: true, legacyHeaders: false }));
   app.use('/api/auth/github', rateLimit({ windowMs: 10 * 60_000, limit: 20, standardHeaders: true, legacyHeaders: false }));
   app.use(['/api/ops/:id', '/api/ops/:id/*rest'], (req, res, next) => (UUID.test(req.params.id) ? next() : res.status(404).json({ error: 'Operation not found' })));
@@ -147,6 +164,16 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
     for (const c of clients) if (filter(c)) c.res.write(data);
   };
   const debounce = new Map();
+  // A change to a private job is announced to members only: its timing is private too.
+  const pushQueue = (scope) => {
+    if (!scope) return;
+    if (scope === 'all') publicCache.delete('ci-queue');
+    for (const members of scope === 'all' ? [true, false] : [true]) {
+      const key = `ci-queue|${members}`;
+      clearTimeout(debounce.get(key));
+      debounce.set(key, setTimeout(() => push('ci-queue', { at: new Date(clock()).toISOString() }, (c) => !!memberOf(settings, c.user) === members), 1000));
+    }
+  };
   function onStateFile(file) {
     const name = file.replace(/\.json$/, '');
     clearTimeout(debounce.get(name));
@@ -348,6 +375,7 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
     return value;
   };
   app.get('/api/ci', (req, res) => res.json(memberOf(settings, user(req)) ? ci.summary({ admin: isAdmin(req) }) : cached('ci', () => ci.publicSummary())));
+  app.get('/api/ci/queue', (req, res) => res.json(memberOf(settings, user(req)) ? orgQueue.summary({ full: true }) : cached('ci-queue', () => orgQueue.summary())));
   app.post('/api/ci/reporters', ...adminWrite, (req, res) => {
     try {
       const { id, token } = ci.addReporter(req.body?.label);
@@ -401,8 +429,9 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
     app.get('/{*path}', (req, res) => res.set('Cache-Control', 'no-cache').sendFile('index.html', { root: dist }));
   }
   app.use((error, req, res, next) => { if (res.headersSent) return next(error); res.status([400, 413].includes(error.status) ? error.status : 500).json({ error: error.status === 413 ? 'Request body too large' : 'Request could not be processed' }); });
-  app.close = () => { for (const w of watchers) w.close(); for (const c of clients) c.res.end(); };
+  app.close = () => { for (const w of watchers) w.close(); for (const c of clients) c.res.end(); orgQueue.flush(); };
   app.ci = ci;
+  app.tickQueue = () => orgQueue.tick().then(pushQueue);
   return app;
 }
 
@@ -421,8 +450,11 @@ export function startWeb() {
   const origin = process.env.PUBLIC_ORIGIN || 'https://status.testnet.networks.dash.org';
   const id = process.env.GITHUB_OAUTH_CLIENT_ID, secret = process.env.GITHUB_OAUTH_CLIENT_SECRET;
   // The OAuth app's client credentials raise GitHub's public-API limit to 5000/h.
-  const app = createWeb({ dataDir, origin, ciGithub: id && secret ? { id, secret } : null, mainnetReportToken: process.env.MAINNET_REPORT_TOKEN });
-  const ciTimer = setInterval(() => app.ci.tick(), 60_000);
+  // Actions queue: org webhook secret; an optional read-only token (Actions: read on
+  // every repository) lets the sweep check private repositories as well.
+  const ciQueue = { org: process.env.CI_QUEUE_ORG || 'dashpay', secret: process.env.CI_WEBHOOK_SECRET || null, token: process.env.CI_QUEUE_GITHUB_TOKEN || null };
+  const app = createWeb({ dataDir, origin, ciGithub: id && secret ? { id, secret } : null, ciQueue, mainnetReportToken: process.env.MAINNET_REPORT_TOKEN });
+  const ciTimer = setInterval(() => { app.ci.tick(); app.tickQueue(); }, 60_000);
   ciTimer.unref();
   const server = app.listen(Number(process.env.PORT) || 3001, process.env.BIND_ADDRESS || '127.0.0.1', () => console.log(`dash-status web on ${process.env.PORT || 3001}`));
   for (const s of ['SIGTERM', 'SIGINT']) process.on(s, () => { app.close(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 3000).unref(); });

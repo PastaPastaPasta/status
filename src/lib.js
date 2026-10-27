@@ -39,12 +39,12 @@ let backoff = 1000;
 function ensureStream() {
   if (source) return;
   source = new EventSource('/api/stream');
-  for (const type of ['network', 'op', 'settings', 'ci', 'aws', 'remediation']) source.addEventListener(type, (e) => {
+  for (const type of ['network', 'op', 'settings', 'ci', 'ci-queue', 'aws', 'remediation']) source.addEventListener(type, (e) => {
     const data = JSON.parse(e.data);
     listeners.forEach((l) => l(type, data));
   });
   source.onopen = () => {
-    if (backoff > 1000) listeners.forEach((l) => { l('network', { name: '*' }); l('op', { id: '*' }); l('ci', {}); l('aws', {}); });
+    if (backoff > 1000) listeners.forEach((l) => { l('network', { name: '*' }); l('op', { id: '*' }); l('ci', {}); l('ci-queue', {}); l('aws', {}); });
     backoff = 1000;
   };
   source.onerror = () => {
@@ -140,6 +140,13 @@ export function span(sec) {
   if (sec % 3600 === 0) return `${sec / 3600} h`;
   if (sec % 60 === 0) return `${sec / 60} min`;
   return `${sec} s`;
+}
+// Job and queue times: 45s, 12m 05s, 3h 07m.
+export function secs(s) {
+  if (s == null) return '—';
+  if (s < 60) return `${Math.round(s)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, '0')}s`;
+  return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
 }
 export function clock(ts) {
   if (!ts) return '—';

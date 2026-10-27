@@ -9,6 +9,7 @@ import Settings from './pages/Settings.jsx';
 import NewDevnet from './pages/NewDevnet.jsx';
 import ResetPlatform from './pages/ResetPlatform.jsx';
 import CI from './pages/CI.jsx';
+import Queue from './pages/Queue.jsx';
 import Aws from './pages/Aws.jsx';
 import Remediation from './pages/Remediation.jsx';
 
@@ -25,6 +26,7 @@ export default function App() {
   else if (parts[0] === 'n' && parts[1] && parts[2] === 'ops' && parts[3]) page = <Operation name={parts[1]} id={parts[3]} />;
   else if (parts[0] === 'n' && parts[1]) page = <Network name={parts[1]} tab={parts[2] || 'hosts'} />;
   else if (parts[0] === 'settings') page = <Settings />;
+  else if (parts[0] === 'ci' && parts[1] === 'queue') page = <Queue />;
   else if (parts[0] === 'ci') page = <CI />;
   else if (parts[0] === 'aws') page = <Aws />;
   else if (parts[0] === 'remediation') page = <Remediation />;
