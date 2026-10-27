@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { ago, api, bytes, clock, pct, useNow, useResource, useSession } from '../lib.js';
-import { Dot, Empty, Err, Meter, Section, Stat } from '../ui.jsx';
+import { ago, api, bytes, clock, pct, secs, useNow, useResource, useSession } from '../lib.js';
+import { Dot, Empty, Err, Link, Meter, Section, Stat } from '../ui.jsx';
 import { Columns, HourStrip, Legend, StripLegend, TipLayer, TipRow } from '../charts.jsx';
 import { SERIES, useTip } from '../viz.js';
 
@@ -15,12 +15,14 @@ const JOB_SERIES = [
   { key: 'other', label: 'Canceled / abandoned', color: SERIES[2] },
 ];
 
-const secs = (s) => {
-  if (s == null) return '—';
-  if (s < 60) return `${Math.round(s)}s`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, '0')}s`;
-  return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
-};
+export function CiTabs({ active }) {
+  return (
+    <div className="ml-auto flex gap-1">
+      <Link to="/ci" className={`btn ${active === 'runners' ? '!border-accent' : ''}`}>Runners</Link>
+      <Link to="/ci/queue" className={`btn ${active === 'queue' ? '!border-accent' : ''}`}>Actions queue</Link>
+    </div>
+  );
+}
 
 export default function CI() {
   const session = useSession();
@@ -39,6 +41,7 @@ export default function CI() {
       <div className="mt-5 flex flex-wrap items-baseline gap-x-3">
         <h1 className="text-[16px] font-semibold">CI runners</h1>
         <span className="text-dim text-[12px]">self-hosted GitHub Actions runners · live from each runner host, queue times from GitHub</span>
+        <CiTabs active="runners" />
       </div>
       {data.public && <div className="mt-2 text-[12px] text-dim">Public view: hosts are anonymised; branches, links and private repositories are left out. {session.user ? 'Your account has no access to more.' : 'Sign in for details.'}</div>}
       <div className="mt-3 grid gap-2 grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
