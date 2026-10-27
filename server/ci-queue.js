@@ -50,7 +50,8 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
   // served: label set -> last start by any job (`all`) and by a public-repository job (`pub`).
   const st = { jobs: {}, done: [], served: {}, stuck: [], since: null, lastEventAt: null, lastPublicEventAt: null, sweep: null, rate: null, ...readJSON(path, {}) };
   let saveTimer = null;
-  const flush = () => { clearTimeout(saveTimer); writeAtomic(path, JSON.stringify(st)); };
+  // A failed write (disk full) must not crash the server or stop the sweep; the next save retries.
+  const flush = () => { clearTimeout(saveTimer); try { writeAtomic(path, JSON.stringify(st)); } catch (e) { log('ci queue save:', e.message); } };
   const save = () => { clearTimeout(saveTimer); saveTimer = setTimeout(flush, 1000); saveTimer.unref?.(); };
   const iso = () => new Date(clock()).toISOString();
 
@@ -205,7 +206,7 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     const due = (token || github) && (!st.sweep || clock() - Date.parse(st.sweep.at) >= SWEEP_MS);
     if (!due) { const changed = expire(); prune(); if (changed) save(); return changed; }
     ticking = true;
-    try { await sweep(); return true; } catch (e) { log('ci queue sweep:', e.message); st.sweep = { ...st.sweep, at: iso(), error: e.message }; return false; } finally { expire(); prune(); flush(); ticking = false; }
+    try { await sweep(); return true; } catch (e) { log('ci queue sweep:', e.message); st.sweep = { ...st.sweep, at: iso(), error: e.message }; return false; } finally { ticking = false; expire(); prune(); flush(); }
   }
 
   // ---- view ----------------------------------------------------------------

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createOrgQueue } from './ci-queue.js';
@@ -209,4 +209,18 @@ test('stuck runs clear once cancelled or once their repository leaves the sweep'
   archived = true; now += 20 * 60_000;
   await q.tick();
   assert.equal(q.summary().totals.stuck, 0, 'repository archived');
+});
+
+test('a failed save is logged and the sweep keeps running', async () => {
+  let now = T0;
+  const logs = [];
+  const dataDir = dir();
+  const fetcher = async (url) => Response.json(url.includes('/orgs/') ? [] : { workflow_runs: [] });
+  const q = createOrgQueue({ dataDir, github: { id: 'c', secret: 's' }, fetcher, clock: () => now, log: (...a) => logs.push(a.join(' ')) });
+  rmSync(join(dataDir, 'ci'), { recursive: true, force: true });
+  writeFileSync(join(dataDir, 'ci'), 'not a directory');
+  assert.equal(await q.tick(), true);
+  assert.match(logs.join('\n'), /ci queue save:/);
+  now += 20 * 60_000;
+  assert.equal(await q.tick(), true, 'not stuck after a failed save');
 });
