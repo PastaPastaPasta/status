@@ -45,9 +45,9 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
   app.use(helmet({ contentSecurityPolicy: { directives: { 'style-src': ["'self'", "'unsafe-inline'"], 'img-src': ["'self'", 'data:', 'https://avatars.githubusercontent.com'] } } }));
   // GitHub org webhook (workflow_job events) for the Actions queue. The HMAC
   // covers the exact bytes GitHub sent, so this reads the raw body. It sits
-  // before the /api rate limit: GitHub sends bursts from a few addresses and
-  // does not retry, and the signature is the gate.
-  app.post('/api/ci/github-webhook', (req, res, next) => (orgQueue.configured() ? next() : res.status(404).json({ error: 'Actions queue webhook is not configured' })),
+  // before the /api rate limit, with a much higher one of its own: GitHub sends
+  // bursts from a few addresses and does not retry; the signature is the gate.
+  app.post('/api/ci/github-webhook', rateLimit({ windowMs: 60_000, limit: 6000, standardHeaders: true, legacyHeaders: false }), (req, res, next) => (orgQueue.configured() ? next() : res.status(404).json({ error: 'Actions queue webhook is not configured' })),
     express.raw({ type: () => true, limit: '512kb' }), (req, res) => {
     if (!orgQueue.verify(req.body, req.get('x-hub-signature-256'))) return res.status(401).json({ error: 'bad signature' });
     const event = req.get('x-github-event');

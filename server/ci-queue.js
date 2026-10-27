@@ -136,13 +136,16 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     for (const r of (await pages(`/orgs/${org}/repos?type=${token ? 'all' : 'public'}`)).items) {
       if (!r.archived && Date.parse(r.pushed_at) > cutoff) repos.set(r.full_name, { full_name: r.full_name, private: r.private });
     }
-    // A job we already track is checked even if its repository is quiet.
-    for (const j of Object.values(st.jobs)) if (!repos.has(j.repo) && (token || !j.private)) repos.set(j.repo, { full_name: j.repo, private: j.private });
+    // A job we already track is checked even if its repository is quiet, and first: the job lookup cap may not reach the rest.
+    const tracked = new Map();
+    for (const j of Object.values(st.jobs)) if (token || !j.private) tracked.set(j.repo, repos.get(j.repo) || { full_name: j.repo, private: j.private });
+    const order = [...tracked.values(), ...[...repos.values()].filter((r) => !tracked.has(r.full_name))];
 
-    // covered: repositories whose every active job the sweep saw, so a tracked job missing there has finished.
-    const seen = new Set(), stuck = [], covered = new Set(), stuckRuns = new Set();
+    // listed: repositories whose active runs were all read, so their stuck runs are known.
+    // covered: also every active job was read, so a tracked job missing there has finished.
+    const seen = new Set(), stuck = [], listed = new Set(), covered = new Set(), stuckRuns = new Set();
     let error = null, jobCalls = 0;
-    for (const repo of repos.values()) {
+    for (const repo of order) {
       try {
         const runs = new Map();
         let complete = true;
@@ -151,12 +154,13 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
           for (const r of res.items) runs.set(r.id, r);
           complete &&= res.complete;
         }
+        if (complete) listed.add(repo.full_name);
         for (const run of runs.values()) {
           // A re-run keeps created_at; run_started_at is the current attempt. Approval waits may last weeks.
           const since = run.run_started_at || run.created_at;
           if (Date.parse(since) < started - STUCK_MS && !['in_progress', 'waiting'].includes(run.status)) {
             stuck.push({ repo: repo.full_name, private: repo.private, runId: run.id, workflow: str(run.name), status: str(run.status, 20), event: str(run.event, 40),
-              branch: str(run.head_branch), createdAt: time(since), url: str(run.html_url, 300) });
+              branch: str(run.head_branch), createdAt: time(since), url: str(run.html_url, 300), confirmedAt: startedAt });
             stuckRuns.add(run.id);
             continue;
           }
@@ -178,26 +182,28 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     for (const [k, j] of Object.entries(st.jobs)) {
       if (covered.has(j.repo) && !seen.has(j.id) && !stuckRuns.has(j.runId) && Date.parse(j.seenAt) < started) delete st.jobs[k];
     }
-    // Repositories the sweep did not reach keep their earlier stuck runs.
-    const reached = new Set(stuck.map((r) => r.repo).concat([...covered]));
-    st.stuck = [...stuck, ...st.stuck.filter((r) => !reached.has(r.repo))].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    // Repositories the sweep could not list keep their earlier stuck runs for a while.
+    const keepOld = (r) => !listed.has(r.repo) && (repos.has(r.repo) || tracked.has(r.repo)) && Date.parse(r.confirmedAt) > started - 2 * HOUR;
+    st.stuck = [...stuck, ...st.stuck.filter(keepOld)].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     st.sweep = { at: startedAt, ms: clock() - started, repos: covered.size, scope: token ? 'all' : 'public', error };
   }
 
-  // Jobs the sweep cannot check (private repositories without a token) end on their own.
+  // Jobs the sweep cannot check (private repositories without a token) end on their own. True if any did.
   function expire() {
     const now = clock();
+    let changed = false;
     for (const [k, j] of Object.entries(st.jobs)) {
       const age = now - Date.parse(j.seenAt);
-      if ((j.status === 'in_progress' && age > 6 * DAY) || (j.status !== 'in_progress' && now - Date.parse(j.createdAt) > STUCK_MS + 12 * HOUR && age > 12 * HOUR)) delete st.jobs[k];
+      if ((j.status === 'in_progress' && age > 6 * DAY) || (j.status !== 'in_progress' && now - Date.parse(j.createdAt) > STUCK_MS + 12 * HOUR && age > 12 * HOUR)) { delete st.jobs[k]; changed = true; }
     }
+    return changed;
   }
 
   let ticking = false;
   async function tick() {
     if (ticking) return false;
     const due = (token || github) && (!st.sweep || clock() - Date.parse(st.sweep.at) >= SWEEP_MS);
-    if (!due) { expire(); prune(); return false; }
+    if (!due) { const changed = expire(); prune(); if (changed) save(); return changed; }
     ticking = true;
     try { await sweep(); return true; } catch (e) { log('ci queue sweep:', e.message); st.sweep = { ...st.sweep, at: iso(), error: e.message }; return false; } finally { expire(); prune(); flush(); ticking = false; }
   }
@@ -206,7 +212,9 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
   // Signed out: public repositories only, without branches, links or runner names.
   function summary({ full = false } = {}) {
     const keep = (x) => full || !x.private;
-    const waiting = Object.values(st.jobs).filter((j) => j.status !== 'in_progress' && keep(j)).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    // Jobs of a stuck run are listed with the run, not as waiting.
+    const stuckRuns = new Set(st.stuck.map((r) => r.runId));
+    const waiting = Object.values(st.jobs).filter((j) => j.status !== 'in_progress' && keep(j) && !stuckRuns.has(j.runId)).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const running = Object.values(st.jobs).filter((j) => j.status === 'in_progress' && keep(j)).sort((a, b) => (a.startedAt || '').localeCompare(b.startedAt || ''));
     // Skipped jobs (an `if:` was false) never wait for a runner; cancelled ones may never have reached one.
     const done = st.done.filter((d) => keep(d) && d.conclusion !== 'skipped');

@@ -170,9 +170,9 @@ test('review regressions: re-runs, approval waits, long matrices and pending job
   const s = q.summary({ full: true });
   assert.deepEqual(s.stuck.map((r) => r.workflow), ['Ghost'], 'neither the re-run nor the approval wait is stuck');
   const ids = new Set(s.waiting.map((j) => j.id));
-  for (const want of [641, 649, 900, 950]) assert.ok(ids.has(want), `job ${want} is still waiting`);
+  for (const want of [641, 649, 900]) assert.ok(ids.has(want), `job ${want} is still waiting`);
   assert.equal(ids.has(960), false, 'a pending job the covered sweep no longer sees has finished');
-  assert.equal(s.totals.waiting, 150 + 1 + 1);
+  assert.equal(s.totals.waiting, 150 + 1, 'job 950 is shown with its stuck run, not as waiting');
 });
 
 test('the public view does not reveal private activity through aggregates', async () => {
@@ -187,4 +187,26 @@ test('the public view does not reveal private activity through aggregates', asyn
   q.webhook('workflow_job', event(job(2, 'queued', { labels: ['dash-x64-light'] })));
   assert.equal(q.summary().labels[0].lastStartedAt, null, 'a private start is not shown on a public label row');
   assert.ok(q.summary({ full: true }).labels[0].lastStartedAt);
+});
+
+test('stuck runs clear once cancelled or once their repository leaves the sweep', async () => {
+  let now = T0, stuckRun = true, archived = false;
+  const fetcher = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === '/orgs/dashpay/repos') return Response.json([{ full_name: 'dashpay/dash', private: false, archived, pushed_at: iso(T0) }]);
+    const runs = stuckRun && u.searchParams.get('status') === 'queued' ? [{ id: 7, name: 'Old', status: 'queued', created_at: iso(T0 - 9 * 86_400_000) }] : [];
+    return Response.json({ workflow_runs: runs });
+  };
+  const q = createOrgQueue({ dataDir: dir(), github: { id: 'c', secret: 's' }, fetcher, clock: () => now });
+  await q.tick();
+  assert.equal(q.summary().totals.stuck, 1);
+  stuckRun = false; now += 20 * 60_000;
+  await q.tick();
+  assert.equal(q.summary().totals.stuck, 0, 'cancelled');
+  stuckRun = true; now += 20 * 60_000;
+  await q.tick();
+  assert.equal(q.summary().totals.stuck, 1);
+  archived = true; now += 20 * 60_000;
+  await q.tick();
+  assert.equal(q.summary().totals.stuck, 0, 'repository archived');
 });

@@ -147,6 +147,31 @@ currently waiting for a self-hosted runner. It gets these from the GitHub API fo
 public repositories, authenticated with the OAuth app's client credentials (5000
 requests/h). Data is kept in `data/ci/` for 30 days.
 
+**Actions queue** (`/ci/queue`) lists every workflow job in the org that is waiting
+for a runner or running, on GitHub-hosted and self-hosted runners alike. Jobs are
+grouped by their `runs-on` labels, with the wait so far, the 24 h median and p90
+wait, and when a runner last took that label set. Runs queued for over 24 hours,
+which GitHub will never start, are listed separately so they can be cancelled. Signed out,
+the page shows public repositories only, without branches, links or runner names.
+
+- An org webhook keeps the page live. In the org settings, under Webhooks, set the
+  payload URL to `https://status.testnet.networks.dash.org/api/ci/github-webhook`,
+  the content type to `application/json`, and a random secret. Select only the
+  **Workflow jobs** event. Put the same secret in `/etc/dash-status/oauth.env` as
+  `CI_WEBHOOK_SECRET=…` and redeploy. Without it, the endpoint answers 404.
+- Every 15 minutes, a sweep of the REST API covers repositories pushed in the last
+  60 days. It adds jobs queued before the webhook existed, drops jobs whose
+  completion was never delivered, and finds stuck runs. It uses the OAuth app
+  credentials, which cover public repositories only. With
+  `CI_QUEUE_GITHUB_TOKEN=…` (a fine-grained token with read-only *Actions* and
+  *Metadata* on all dashpay repositories), it covers private ones too. Without
+  the token, private repositories rely on the webhook alone. The sweep stops
+  while fewer than 1500 requests remain this hour, leaving the rest for the
+  runner page.
+- State is kept in `data/ci/org-queue.json`: active jobs, finished jobs for 24 h,
+  and label sets served for 30 days. Set `CI_QUEUE_ORG` to change the
+  organisation (default `dashpay`).
+
 **AWS** (`/aws`) is an account-wide, read-only inventory collected by the agent
 through the inline policy [status-inventory](deploy/iam/status-inventory.json)
 on `dash-status-server`:
