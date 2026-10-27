@@ -133,7 +133,8 @@ test('dash-ci-pool hosts: pools count as capacity, single-use runner jobs are ti
   assert.equal(ci.summary().pools[0].status, 'short');
   // Draining empties the pool on purpose: what is left is the capacity, not its size.
   ci.ingest(id, { ...report(), runners: [], pools: [{ ...pool, idle: 0, starting: 0, draining: true }] });
-  assert.deepEqual([ci.summary().pools[0].status, ci.summary().totals.runners, ci.summary().totals.online], ['draining', 1, 1]);
+  const drained = ci.summary();
+  assert.deepEqual([drained.pools[0].status, drained.totals.runners, drained.totals.online], ['draining', 1, 1]);
   ci.ingest(id, { ...report(), runners: [], pools: [pool] });
   assert.deepEqual([p.day.jobs, p.day.failed, p.day.busySec], [2, 1, 60]);
   assert.equal(p.hours.length, 48);

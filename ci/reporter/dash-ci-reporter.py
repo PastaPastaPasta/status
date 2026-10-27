@@ -14,9 +14,9 @@ Read-only on the host. Python 3.9+ standard library only (macOS ships 3.9).
 comes from its status.json and finished jobs from its jobs.jsonl, which the
 controller writes from each runner's logs before destroying it.
 
-Jobs of long-lived runners come from the runner listener log (_diag/Runner_*.log: "Running job" and
-"Job ... completed with result"); repository, workflow and run come from the
-job's worker log (_diag/Worker_*.log), which the runner writes as the job starts.
+Jobs of long-lived runners come from the runner listener log (_diag/Runner_*.log:
+"Running job" and "Job ... completed with result"); repository, workflow and run
+come from the job's worker log (_diag/Worker_*.log), which the runner writes as the job starts.
 """
 import bisect
 import datetime
@@ -55,6 +55,10 @@ DISPLAY = re.compile(r'"jobDisplayName":\s*"((?:[^"\\]|\\.){0,500})"')
 
 def iso(ts):
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def describe(e, limit=300):
+    return ('%s: %s' % (type(e).__name__, e))[:limit]
 
 
 def parse_ts(text):
@@ -319,13 +323,14 @@ def collect_pool(directory, state, pending, now):
         stale = age > POOL_STALE  # a stopped controller leaves its last status behind
         instances = [] if stale else status.get('instances', [])
         for name, p in sorted(status.get('pools', {}).items()):
-            pools.append(dict(controller=status.get('host'), name=name, backend=p.get('backend'), labels=p.get('labels', []),
-                              size=p.get('size'), idle=0 if stale else p.get('idle'), busy=0 if stale else p.get('busy'),
-                              starting=0 if stale else p.get('starting'), draining=status.get('draining') is True, at=iso(status['time']),
+            counts = dict(idle=0, busy=0, starting=0) if stale else {k: p.get(k) for k in ('idle', 'busy', 'starting')}
+            pools.append(dict(controller=status.get('host'), name=name, backend=p.get('backend'), labels=p.get('labels', []), size=p.get('size'),
+                              draining=status.get('draining') is True, at=iso(status['time']),
                               error='dash-ci-pool has not updated its status for %d min' % (age // 60) if stale else None,
-                              instances=[dict(name=i['name'], state=i['state'], since=iso(i['since'])) for i in instances if i.get('pool') == name][:64]))
+                              instances=[dict(name=i['name'], state=i['state'], since=iso(i['since'])) for i in instances if i.get('pool') == name][:64],
+                              **counts))
     except Exception as e:  # jobs are still delivered
-        error = ('%s: %s' % (type(e).__name__, e))[:300]
+        error = describe(e)
     seen = state.setdefault('poolSeen', [])
     known = set(seen)
     try:
@@ -334,7 +339,7 @@ def collect_pool(directory, state, pending, now):
     except FileNotFoundError:
         lines = []
     except Exception as e:
-        lines, error = [], error or ('%s: %s' % (type(e).__name__, e))[:300]
+        lines, error = [], error or describe(e)
     for line in lines:
         try:
             j = json.loads(line)
@@ -469,19 +474,19 @@ def collect(config, state, now):
                 slow.setdefault('diagAt', {})[key] = now
             info['diag'] = slow.get('diag', {}).get(key)
         except Exception as e:  # report what is wrong instead of going silent
-            info['error'] = ('%s: %s' % (type(e).__name__, e))[:300]
+            info['error'] = describe(e)
         runners.append(info)
     pools = []
     for directory in config.get('pools', []):
         try:
             pools += collect_pool(directory, state, pending, now)
         except Exception as e:
-            pools.append(dict(name=os.path.basename(directory.rstrip('/')) or 'dash-ci-pool', error=('%s: %s' % (type(e).__name__, e))[:300]))
+            pools.append(dict(name=os.path.basename(directory.rstrip('/')) or 'dash-ci-pool', error=describe(e)))
     del pending[:-MAX_PENDING]
     try:
         host = host_metrics()
     except Exception as e:  # metrics never block job delivery
-        host = dict(hostname=socket.gethostname(), error=('%s: %s' % (type(e).__name__, e))[:200])
+        host = dict(hostname=socket.gethostname(), error=describe(e, 200))
     if now - slow.get('dockerAt', 0) > 600:
         try:
             slow['docker'] = docker_usage()

@@ -7,7 +7,7 @@ import { SERIES, useTip } from '../viz.js';
 const STATUS = { busy: ['deploying', 'running a job'], idle: ['ok', 'idle'], offline: ['down', 'offline'], error: ['warn', 'reporter error'] };
 // A pool keeps `size` single-use runners ready; each takes one job and is replaced.
 const POOL_STATUS = { ok: ['ok', 'ready'], short: ['warn', 'below size'], draining: ['warn', 'draining'], offline: ['down', 'offline'], error: ['warn', 'reporter error'] };
-const DEFAULT_LABELS = new Set(['self-hosted', 'Linux', 'X64']);
+const COMMON_LABELS = new Set(['self-hosted', 'Linux', 'X64', 'dash-ci-pool']);
 const RESULT = { Succeeded: 'lv-ok', Failed: 'lv-down', Canceled: 'text-dim', Abandoned: 'lv-warn' };
 const JOB_SERIES = [
   { key: 'succeeded', label: 'Succeeded', color: SERIES[0] },
@@ -32,7 +32,7 @@ export default function CI() {
   if (error) return <div className="mt-6"><Err error={error} /></div>;
   if (!data) return <div className="mt-6 text-dim">Loading…</div>;
   const t = data.totals;
-  const hosts = data.hosts.map((h) => ({ ...h, runners: data.runners.filter((r) => r.host === h.id), pools: (data.pools || []).filter((p) => p.host === h.id) }));
+  const hosts = data.hosts.map((h) => ({ ...h, runners: data.runners.filter((r) => r.host === h.id), pools: data.pools.filter((p) => p.host === h.id) }));
   return (
     <div>
       <TipLayer tip={tip} />
@@ -42,7 +42,7 @@ export default function CI() {
       </div>
       {data.public && <div className="mt-2 text-[12px] text-dim">Public view: hosts are anonymised; branches, links and private repositories are left out. {session.user ? 'Your account has no access to more.' : 'Sign in for details.'}</div>}
       <div className="mt-3 grid gap-2 grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
-        <Stat label="Runners online" value={`${t.online}/${t.runners}`} level={t.online + (t.starting || 0) < t.runners ? 'down' : 'ok'} sub={`${t.busy} busy now${t.starting ? ` · ${t.starting} starting` : ''}`} />
+        <Stat label="Runners online" value={`${t.online}/${t.runners}`} level={t.online + t.starting < t.runners ? 'down' : 'ok'} sub={`${t.busy} busy now${t.starting ? ` · ${t.starting} starting` : ''}`} />
         <Stat label="Waiting for a runner" value={data.queue ? t.queuedNow : '—'} level={t.queuedNow > 0 ? 'warn' : undefined}
           sub={t.oldestQueuedAt ? `oldest ${ago(t.oldestQueuedAt, now)}` : data.queue ? `checked ${ago(data.queue.at, now)} ago` : 'GitHub not polled yet'} />
         <Stat label="Jobs · 24h" value={t.jobs24h} sub={`${t.succeeded24h} ok · ${t.failed24h} failed`} />
@@ -177,13 +177,13 @@ function PoolRow({ p, now, bind }) {
         <Dot level={p.busy ? 'deploying' : level} className={p.busy ? 'live' : ''} />
         <span className="mono font-semibold">{p.name} pool</span>
         <span className={`lv-${level}`}>{label}</span>
-        {(p.labels || []).filter((l) => !DEFAULT_LABELS.has(l) && l !== 'dash-ci-pool').map((l) => <span key={l} className="tag">{l}</span>)}
+        {p.labels.filter((l) => !COMMON_LABELS.has(l)).map((l) => <span key={l} className="tag">{l}</span>)}
         <span className="text-dim mono text-[11px]">single-use{p.backend ? ` · ${p.backend}` : ''}</span>
         <span className="ml-auto text-dim text-[11px]">24h: <span className="mono text-fg">{p.day.jobs}</span> jobs{p.day.failed ? <> · <span className="mono lv-down">{p.day.failed}</span> failed</> : null} · busy <span className="mono text-fg">{pct(p.size ? Math.min(100, (p.day.busySec / (p.size * 86400)) * 100) : 0)}</span></span>
       </div>
       <div className="mt-1 text-[12px] text-dim">
         <span className="mono text-fg">{p.online}</span>/{p.size} online: <span className="mono text-fg">{p.busy}</span> running a job · <span className="mono text-fg">{p.idle}</span> waiting{p.starting ? <> · <span className="mono text-fg">{p.starting}</span> starting</> : null}
-        {p.running?.length > 0 && <span className="mono"> · oldest job {ago(p.running.reduce((a, i) => (!a || i.since < a ? i.since : a), null), now)}</span>}
+        {p.running.length > 0 && <span className="mono"> · oldest job {ago(p.running.reduce((a, i) => (!a || i.since < a ? i.since : a), null), now)}</span>}
       </div>
       {p.error && <div className="mt-1 text-[11.5px] lv-warn mono truncate" title={p.error}>{p.error}</div>}
       <div className="mt-1.5"><HourStrip hours={p.hours} bind={bind} label={`${p.name} pool: busy share of its ${p.size} runners per hour, last 48 hours`} /></div>
