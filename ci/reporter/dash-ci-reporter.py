@@ -39,6 +39,7 @@ MAX_PENDING = 5000
 BATCH = 250
 WORKER_HEAD = 128 * 1024
 POOL_SEEN = 5000
+POOL_LINES = POOL_SEEN // 2  # newest ledger lines read: fewer than remembered keys, so none is sent twice
 POOL_STALE = 120
 JOB_KEYS = ('name', 'start', 'end', 'result', 'repo', 'runId', 'attempt', 'workflow', 'event', 'headRef', 'ref', 'visibility')
 EXTRA_PATH = ['/opt/homebrew/bin', '/usr/local/bin', os.path.expanduser('~/.orbstack/bin'), '/usr/bin', '/bin', '/usr/sbin', '/sbin']
@@ -335,7 +336,7 @@ def collect_pool(directory, state, pending, now):
     known = set(seen)
     try:
         with open(os.path.join(directory, 'jobs.jsonl')) as f:
-            lines = f.read().splitlines()
+            lines = f.read().splitlines()[-POOL_LINES:]
     except FileNotFoundError:
         lines = []
     except Exception as e:

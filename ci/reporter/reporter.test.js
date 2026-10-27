@@ -145,5 +145,12 @@ test('reporter sends dash-ci-pool pools and each single-use runner job once', { 
     const stale = bodies.at(-1).pools[0];
     assert.match(stale.error, /has not updated its status for 10 min/);
     assert.deepEqual([stale.busy, stale.idle, stale.instances], [0, 0, []]);
+
+    // A ledger longer than the reporter remembers is never replayed.
+    writeFileSync(join(pool, 'jobs.jsonl'), Array.from({ length: 6000 }, (_, i) => ledgerJob(`r730-light-${String(i).padStart(6, '0')}`)).join(''));
+    writeFileSync(join(pool, 'status.json'), status(Math.floor(Date.now() / 1000)));
+    const sent = async () => { let n = 0; for (let i = 0; i < 12; i++) { p = await run(); assert.equal(p.status, 0, p.stderr); n += bodies.at(-1).jobs.length; } return n; };
+    assert.equal(await sent(), 2500);
+    assert.equal(await sent(), 0);
   } finally { server.close(); }
 });
