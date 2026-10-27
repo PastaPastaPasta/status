@@ -99,3 +99,49 @@ test('reporter parses runner logs, delivers jobs once and resumes from its offse
     assert.equal(state.runners[runner].after, oldLog);
   } finally { server.close(); }
 });
+
+test('reporter sends dash-ci-pool pools and each single-use runner job once', { skip: !python && 'python3 not installed' }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dcr-pool-'));
+  const pool = join(root, 'run-dash-ci-pool'), home = join(root, 'home');
+  mkdirSync(pool); mkdirSync(home);
+  const now = Math.floor(Date.now() / 1000);
+  const status = (time) => JSON.stringify({ time, host: 'r730', draining: false, runners: 2, busy: 1,
+    pools: { light: { size: 12, idle: 1, busy: 1, starting: 0, labels: ['self-hosted', 'Linux', 'X64', 'dash-x64-light'], backend: 'proxmox-lxc' } },
+    instances: [{ name: 'r730-light-aaaaaa', pool: 'light', state: 'busy', since: now - 30 }, { name: 'r730-light-bbbbbb', pool: 'light', state: 'idle', since: now - 300 }] });
+  writeFileSync(join(pool, 'status.json'), status(now));
+  const ledgerJob = (runner, extra = {}) => JSON.stringify({ runner, pool: 'light', name: 'Lint', start: '2026-10-27T19:42:00Z', end: '2026-10-27T19:42:09Z', result: 'Succeeded', repo: 'dashpay/dash', runId: 123, attempt: 1, workflow: 'CI', ...extra }) + '\n';
+  writeFileSync(join(pool, 'jobs.jsonl'), ledgerJob('r730-light-cccccc') + 'not json\n' + ledgerJob('r730-light-dddddd', { repo: undefined, result: 'Abandoned', end: null }));
+
+  const bodies = [];
+  const server = createServer((req, res) => {
+    let b = ''; req.on('data', (c) => { b += c; });
+    req.on('end', () => { bodies.push(JSON.parse(b)); res.setHeader('content-type', 'application/json'); res.end('{}'); });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ url: `http://127.0.0.1:${server.address().port}/api/ci/report`, token: 'dcr_test_token', runners: [], pools: [pool, join(root, 'missing')] }));
+  const run = () => new Promise((resolve) => {
+    const p = spawn('python3', [SCRIPT], { env: { ...process.env, DASH_CI_REPORTER_HOME: home } });
+    let stderr = ''; p.stderr.on('data', (d) => { stderr += d; });
+    p.on('close', (status) => resolve({ status, stderr }));
+  });
+  try {
+    let p = await run();
+    assert.equal(p.status, 0, p.stderr);
+    const first = bodies.at(-1);
+    assert.equal(first.reporter, '2');
+    const [light, missing] = first.pools;
+    assert.deepEqual([light.name, light.controller, light.size, light.busy, light.backend, light.error], ['light', 'r730', 12, 1, 'proxmox-lxc', null]);
+    assert.deepEqual(light.instances.map((i) => [i.name, i.state]), [['r730-light-aaaaaa', 'busy'], ['r730-light-bbbbbb', 'idle']]);
+    assert.match(missing.error, /FileNotFoundError/);
+    assert.deepEqual(first.jobs.map((j) => [j.runnerName, j.pool, j.result, j.repo ?? null, j.end ?? null]),
+      [['r730-light-cccccc', 'light', 'Succeeded', 'dashpay/dash', '2026-10-27T19:42:09Z'], ['r730-light-dddddd', 'light', 'Abandoned', null, null]]);
+
+    // Already delivered: not sent again; a new ledger line is. A controller that stopped updating is an error.
+    appendFileSync(join(pool, 'jobs.jsonl'), ledgerJob('r730-light-eeeeee'));
+    writeFileSync(join(pool, 'status.json'), status(now - 600));
+    p = await run();
+    assert.equal(p.status, 0, p.stderr);
+    assert.deepEqual(bodies.at(-1).jobs.map((j) => j.runnerName), ['r730-light-eeeeee']);
+    assert.match(bodies.at(-1).pools[0].error, /has not updated its status for 10 min/);
+  } finally { server.close(); }
+});

@@ -6,10 +6,15 @@ Read-only on the host. Python 3.9+ standard library only (macOS ships 3.9).
 
   ~/.dash-ci-reporter/config.json   {"url": ".../api/ci/report", "token": "...",
                                      "runners": [{"dir": "/path/actions-runner"},
-                                                 {"container": "name", "dir": "/runner"}]}
+                                                 {"container": "name", "dir": "/runner"}],
+                                     "pools": ["/run/dash-ci-pool"]}
   ~/.dash-ci-reporter/state.json    log offsets, jobs not yet delivered
 
-Jobs come from the runner listener log (_diag/Runner_*.log: "Running job" and
+"pools" are dash-ci-pool hosts (single-use runners, one job each): pool state
+comes from its status.json and finished jobs from its jobs.jsonl, which the
+controller writes from each runner's logs before destroying it.
+
+Jobs of long-lived runners come from the runner listener log (_diag/Runner_*.log: "Running job" and
 "Job ... completed with result"); repository, workflow and run come from the
 job's worker log (_diag/Worker_*.log), which the runner writes as the job starts.
 """
@@ -28,11 +33,14 @@ import time
 import urllib.error
 import urllib.request
 
-REPORTER_VERSION = '1'
+REPORTER_VERSION = '2'
 BACKFILL_DAYS = 14
 MAX_PENDING = 5000
 BATCH = 250
 WORKER_HEAD = 128 * 1024
+POOL_SEEN = 5000
+POOL_STALE = 120
+JOB_KEYS = ('name', 'start', 'end', 'result', 'repo', 'runId', 'attempt', 'workflow', 'event', 'headRef', 'ref', 'visibility')
 EXTRA_PATH = ['/opt/homebrew/bin', '/usr/local/bin', os.path.expanduser('~/.orbstack/bin'), '/usr/bin', '/bin', '/usr/sbin', '/sbin']
 
 LOG_NAME = re.compile(r'^(Runner|Worker)_(\d{8}-\d{6})-utc\.log$')
@@ -301,6 +309,42 @@ def add_meta(r, job, workers):
         pass
 
 
+def collect_pool(directory, state, pending, now):
+    """Pools of a dash-ci-pool controller; its newly finished jobs go to `pending`."""
+    with open(os.path.join(directory, 'status.json')) as f:
+        status = json.load(f)
+    age = now - status['time']
+    instances = status.get('instances', [])
+    pools = []
+    for name, p in sorted(status.get('pools', {}).items()):
+        pools.append(dict(controller=status.get('host'), name=name, backend=p.get('backend'), labels=p.get('labels', []),
+                          size=p.get('size'), idle=p.get('idle'), busy=p.get('busy'), starting=p.get('starting'),
+                          draining=status.get('draining') is True, at=iso(status['time']),
+                          error='dash-ci-pool has not updated its status for %d min' % (age // 60) if age > POOL_STALE else None,
+                          instances=[dict(name=i['name'], state=i['state'], since=iso(i['since'])) for i in instances if i.get('pool') == name][:64]))
+    seen = state.setdefault('poolSeen', [])
+    known = set(seen)
+    try:
+        with open(os.path.join(directory, 'jobs.jsonl')) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    for line in lines:
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        runner = j.get('runner') if isinstance(j, dict) else None
+        if not isinstance(runner, str) or runner in known:
+            continue
+        known.add(runner)
+        seen.append(runner)
+        job = {k: j[k] for k in JOB_KEYS if j.get(k) is not None}
+        pending.append(dict(job, runner=runner, runnerName=runner, pool=j.get('pool')))
+    del seen[:-POOL_SEEN]
+    return pools
+
+
 def host_metrics():
     h = dict(hostname=socket.gethostname(), arch=platform.machine(), cpus=os.cpu_count(), load=[round(x, 2) for x in os.getloadavg()])
     if sys.platform == 'darwin':
@@ -416,6 +460,12 @@ def collect(config, state, now):
         except Exception as e:  # report what is wrong instead of going silent
             info['error'] = ('%s: %s' % (type(e).__name__, e))[:300]
         runners.append(info)
+    pools = []
+    for directory in config.get('pools', []):
+        try:
+            pools += collect_pool(directory, state, pending, now)
+        except Exception as e:
+            pools.append(dict(name=os.path.basename(directory.rstrip('/')) or 'dash-ci-pool', error=('%s: %s' % (type(e).__name__, e))[:300]))
     del pending[:-MAX_PENDING]
     try:
         host = host_metrics()
@@ -428,7 +478,7 @@ def collect(config, state, now):
             slow['docker'] = dict(error=str(e)[:200])
         slow['dockerAt'] = now
     host['docker'] = slow.get('docker')
-    return dict(v=1, reporter=REPORTER_VERSION, python=platform.python_version(), at=iso(now), host=host, runners=runners)
+    return dict(v=1, reporter=REPORTER_VERSION, python=platform.python_version(), at=iso(now), host=host, runners=runners, pools=pools)
 
 
 def post(config, payload):
@@ -457,7 +507,7 @@ def main(argv):
         payload = collect(config, state, time.time())
         # A job that just started may still get its repository from a later
         # listing (its worker log appears after "Running job"); give it a run.
-        settled = lambda j: 'repo' in j or j.get('metaTries', 0) >= 2 or time.time() - parse_ts(j['start'][:19].replace('T', ' ')) > 3600
+        settled = lambda j: 'repo' in j or 'pool' in j or j.get('metaTries', 0) >= 2 or time.time() - parse_ts(j['start'][:19].replace('T', ' ')) > 3600
         ready = [j for j in state['pending'] if settled(j)][:BATCH]
         batch = [{k: v for k, v in j.items() if k not in ('log', 'metaTries')} for j in ready]
         payload['jobs'] = batch
