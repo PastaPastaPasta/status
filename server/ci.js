@@ -20,15 +20,15 @@ const ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 const TS = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
 
-const str = (v, n = 200) => (typeof v === 'string' ? v.slice(0, n) : null);
+export const str = (v, n = 200) => (typeof v === 'string' ? v.slice(0, n) : null);
 const int = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : null);
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null);
 const ts = (v) => (typeof v === 'string' && TS.test(v) && Number.isFinite(Date.parse(v)) ? v : null);
 const sha256 = (s) => createHash('sha256').update(s).digest('hex');
 // owner/name as GitHub allows; never "." or ".." (they would reach other API paths).
 const repoOf = (v) => (typeof v === 'string' && REPO.test(v) && !v.split('/').some((p) => p === '.' || p === '..') ? v : null);
-const median = (xs) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return s[Math.floor((s.length - 1) / 2)]; };
-const pctile = (xs, p) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+export const median = (xs) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return s[Math.floor((s.length - 1) / 2)]; };
+export const pctile = (xs, p) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
 const overlap = (a0, a1, b0, b1) => Math.max(0, Math.min(a1, b1) - Math.max(a0, b0));
 
 function cleanJob(j, hostId) {

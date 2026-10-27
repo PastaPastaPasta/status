@@ -17,6 +17,7 @@ export default function Queue() {
   if (error) return <div className="mt-6"><Err error={error} /></div>;
   if (!data) return <div className="mt-6 text-dim">Loading…</div>;
   const t = data.totals;
+  const age = (ts) => (now - Date.parse(ts)) / 1000;
   const live = data.configured.webhook || data.configured.sweep;
   const show = (j) => (!repo || j.repo === repo) && (!labels || labelKey(j.labels) === labels);
   const waiting = data.waiting.filter(show), running = data.running.filter(show);
@@ -35,7 +36,7 @@ export default function Queue() {
       ) : (
         <>
           <div className="mt-3 grid gap-2 grid-cols-2 md:grid-cols-3 xl:grid-cols-5">
-            <Stat label="Waiting for a runner" value={t.waiting} level={t.oldestWaitingAt && (now - Date.parse(t.oldestWaitingAt)) / 1000 > SLOW_SEC ? 'warn' : undefined}
+            <Stat label="Waiting for a runner" value={t.waiting} level={t.oldestWaitingAt && age(t.oldestWaitingAt) > SLOW_SEC ? 'warn' : undefined}
               sub={t.oldestWaitingAt ? `oldest ${ago(t.oldestWaitingAt, now)}` : 'none'} />
             <Stat label="Running now" value={t.running} sub={`${data.labels.filter((g) => g.running).length} runner label sets`} />
             <Stat label="Wait · 24h" value={secs(t.medianWaitSec24h)} sub={t.p90WaitSec24h != null ? `p90 ${secs(t.p90WaitSec24h)}` : 'median, queued → started'} level={t.p90WaitSec24h > SLOW_SEC ? 'warn' : undefined} />
@@ -49,9 +50,9 @@ export default function Queue() {
                 <thead><tr><th>runs-on labels</th><th>Runners</th><th className="text-right">Waiting</th><th className="text-right">Oldest wait</th><th className="text-right">Running</th><th className="text-right">Median wait · 24h</th><th className="text-right">p90</th><th className="text-right">Jobs · 24h</th><th>Last picked up</th></tr></thead>
                 <tbody>
                   {data.labels.map((g) => {
-                    const oldest = g.oldestWaitingAt ? (now - Date.parse(g.oldestWaitingAt)) / 1000 : null;
+                    const oldest = g.oldestWaitingAt ? age(g.oldestWaitingAt) : null;
                     // Waiting jobs whose labels no runner has taken in a day or more of recording.
-                    const orphan = g.waiting > 0 && !g.lastStartedAt && data.since && now - Date.parse(data.since) > 86_400_000;
+                    const orphan = g.waiting > 0 && !g.lastStartedAt && data.since && age(data.since) > 86_400;
                     return (
                       <tr key={g.key} className={labels === g.key ? 'open' : ''} onClick={() => setLabels(labels === g.key ? null : g.key)}>
                         <td>{g.labels.length ? g.labels.map((l) => <span key={l} className="tag mr-1">{l}</span>) : <span className="text-dim">none</span>}</td>
@@ -81,7 +82,7 @@ export default function Queue() {
                 <tbody>
                   {waiting.map((j) => (
                     <tr key={j.id}>
-                      <td className={`mono ${(now - Date.parse(j.createdAt)) / 1000 > SLOW_SEC ? 'lv-warn' : ''}`} title={clock(j.createdAt)}>{ago(j.createdAt, now)}</td>
+                      <td className={`mono ${age(j.createdAt) > SLOW_SEC ? 'lv-warn' : ''}`} title={clock(j.createdAt)}>{ago(j.createdAt, now)}</td>
                       <td className="mono">{j.repo}{j.private && <span className="tag ml-1.5">private</span>}</td>
                       <td className="max-w-[460px] truncate"><JobLink j={j} />{j.status === 'waiting' && <span className="tag ml-1.5" title="waiting for a deployment environment's approval or wait timer">approval</span>}</td>
                       <td className="mono text-dim">{j.labels.join(', ')}</td>
@@ -140,7 +141,7 @@ export default function Queue() {
       )}
       <div className="mt-3 text-faint text-[11px]">
         {data.configured.webhook ? `Org webhook: last event ${data.lastEventAt ? `${ago(data.lastEventAt, now)} ago` : 'not received yet'}.` : 'Org webhook not configured: the queue updates only when GitHub is swept.'}{' '}
-        {data.sweep ? `Swept ${data.sweep.repos} active ${data.sweep.scope === 'all' ? '' : 'public '}repositories ${ago(data.sweep.at, now)} ago.` : data.configured.sweep ? 'First sweep pending.' : ''}
+        {data.sweep ? `Swept ${data.sweep.repos != null ? `${data.sweep.repos} ` : ''}active ${data.sweep.scope === 'all' ? '' : 'public '}repositories ${ago(data.sweep.at, now)} ago.` : data.configured.sweep ? 'First sweep pending.' : ''}
         {data.sweep?.error ? ` Last sweep error: ${data.sweep.error}.` : ''}
         {data.sweep?.rate ? ` ${data.sweep.rate.remaining} GitHub requests left this hour.` : ''}
       </div>

@@ -43,6 +43,21 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
   // nginx on the host reaches the container through the Docker bridge gateway.
   app.set('trust proxy', ['loopback', 'uniquelocal']);
   app.use(helmet({ contentSecurityPolicy: { directives: { 'style-src': ["'self'", "'unsafe-inline'"], 'img-src': ["'self'", 'data:', 'https://avatars.githubusercontent.com'] } } }));
+  // GitHub org webhook (workflow_job events) for the Actions queue. The HMAC
+  // covers the exact bytes GitHub sent, so this reads the raw body. It sits
+  // before the /api rate limit: GitHub sends bursts from a few addresses and
+  // does not retry, and the signature is the gate.
+  app.post('/api/ci/github-webhook', (req, res, next) => (orgQueue.configured() ? next() : res.status(404).json({ error: 'Actions queue webhook is not configured' })),
+    express.raw({ type: () => true, limit: '512kb' }), (req, res) => {
+    if (!orgQueue.verify(req.body, req.get('x-hub-signature-256'))) return res.status(401).json({ error: 'bad signature' });
+    const event = req.get('x-github-event');
+    if (event === 'ping') return res.json({ ok: true });
+    try {
+      const changed = orgQueue.webhook(event, JSON.parse(req.body.toString('utf8')));
+      if (changed) pushQueue();
+      res.status(changed ? 200 : 202).json({ ok: true });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+  });
   app.use('/api', rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: true, legacyHeaders: false }));
   app.use('/api/auth/github', rateLimit({ windowMs: 10 * 60_000, limit: 20, standardHeaders: true, legacyHeaders: false }));
   app.use(['/api/ops/:id', '/api/ops/:id/*rest'], (req, res, next) => (UUID.test(req.params.id) ? next() : res.status(404).json({ error: 'Operation not found' })));
@@ -58,19 +73,6 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
       clearTimeout(debounce.get('ci'));
       debounce.set('ci', setTimeout(() => push('ci', { at: new Date(clock()).toISOString() }), 2000));
       res.json(r);
-    } catch (e) { res.status(400).json({ error: e.message }); }
-  });
-  // GitHub org webhook (workflow_job events) for the Actions queue. The HMAC
-  // covers the exact bytes GitHub sent, so this reads the raw body.
-  app.post('/api/ci/github-webhook', express.raw({ type: () => true, limit: '2mb' }), (req, res) => {
-    if (!orgQueue.configured()) return res.status(404).json({ error: 'Actions queue webhook is not configured' });
-    if (!orgQueue.verify(req.body, req.get('x-hub-signature-256'))) return res.status(401).json({ error: 'bad signature' });
-    const event = req.get('x-github-event');
-    if (event === 'ping') return res.json({ ok: true });
-    try {
-      const changed = orgQueue.webhook(event, JSON.parse(req.body.toString('utf8')));
-      if (changed) pushQueue();
-      res.status(changed ? 200 : 202).json({ ok: true });
     } catch (e) { res.status(400).json({ error: e.message }); }
   });
   app.use(express.json({ limit: '64kb' }));

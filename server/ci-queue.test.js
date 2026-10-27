@@ -142,3 +142,49 @@ test('a token sweeps private repositories too; with no credentials there is no s
   assert.equal(await none.tick(), false);
   assert.deepEqual(none.summary().configured, { webhook: false, sweep: null });
 });
+
+test('review regressions: re-runs, approval waits, long matrices and pending jobs are not lost', async () => {
+  let now = T0;
+  const old = iso(T0 - 3 * 86_400_000);
+  const runs = {
+    queued: [{ id: 1, name: 'CI', status: 'queued', created_at: old, run_started_at: iso(T0 - 5 * 60_000) }, // a re-run of a 3-day-old run
+      { id: 3, name: 'Ghost', status: 'queued', created_at: old }],
+    waiting: [{ id: 2, name: 'Deploy', status: 'waiting', created_at: old }],
+  };
+  const matrix = Array.from({ length: 150 }, (_, i) => job(500 + i, 'queued', { run_id: 1 }));
+  const fetcher = async (url) => {
+    const u = new URL(url);
+    const page = Number(u.searchParams.get('page'));
+    if (u.pathname === '/orgs/dashpay/repos') return Response.json([{ full_name: 'dashpay/dash', private: false, archived: false, pushed_at: iso(T0) }]);
+    if (u.pathname === '/repos/dashpay/dash/actions/runs') return Response.json({ workflow_runs: runs[u.searchParams.get('status')] || [] });
+    if (u.pathname === '/repos/dashpay/dash/actions/runs/1/jobs') return Response.json({ jobs: matrix.slice((page - 1) * 100, page * 100) });
+    if (u.pathname === '/repos/dashpay/dash/actions/runs/2/jobs') return Response.json({ jobs: [job(900, 'waiting', { run_id: 2 })] });
+    return new Response('{}', { status: 404 });
+  };
+  const q = createOrgQueue({ dataDir: dir(), secret: 's', github: { id: 'c', secret: 's' }, fetcher, clock: () => now });
+  q.webhook('workflow_job', event(job(641, 'queued', { run_id: 1 })));      // on page 2 of the matrix
+  q.webhook('workflow_job', event(job(950, 'queued', { run_id: 3 })));      // belongs to a stuck run: kept, not judged
+  assert.equal(q.webhook('workflow_job', event(job(960, 'pending'))), true); // waiting on a concurrency group
+  now += 60_000;
+  await q.tick();
+  const s = q.summary({ full: true });
+  assert.deepEqual(s.stuck.map((r) => r.workflow), ['Ghost'], 'neither the re-run nor the approval wait is stuck');
+  const ids = new Set(s.waiting.map((j) => j.id));
+  for (const want of [641, 649, 900, 950]) assert.ok(ids.has(want), `job ${want} is still waiting`);
+  assert.equal(ids.has(960), false, 'a pending job the covered sweep no longer sees has finished');
+  assert.equal(s.totals.waiting, 150 + 1 + 1);
+});
+
+test('the public view does not reveal private activity through aggregates', async () => {
+  const fetcher = async (url) => Response.json(url.includes('/orgs/') ? [{ full_name: 'dashpay/secret', private: true, archived: false, pushed_at: iso(T0) }] : { workflow_runs: [] });
+  const q = createOrgQueue({ dataDir: dir(), secret: 's', token: 't', fetcher, clock: () => T0 });
+  q.webhook('workflow_job', event(job(1, 'in_progress', { labels: ['dash-x64-light'] }), repo('dashpay/secret', true)));
+  await q.tick();
+  const pub = q.summary();
+  assert.equal(pub.lastEventAt, null);
+  assert.equal(pub.sweep.repos, undefined);
+  assert.equal(pub.labels.length, 0);
+  q.webhook('workflow_job', event(job(2, 'queued', { labels: ['dash-x64-light'] })));
+  assert.equal(q.summary().labels[0].lastStartedAt, null, 'a private start is not shown on a public label row');
+  assert.ok(q.summary({ full: true }).labels[0].lastStartedAt);
+});

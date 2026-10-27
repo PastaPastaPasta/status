@@ -9,23 +9,26 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
 import { readJSON, writeAtomic } from '../shared/settings.js';
+import { median, pctile, str } from './ci.js';
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 const SWEEP_MS = 15 * 60_000;
 // Repositories with no push for this long rarely run anything (GitHub disables their schedules).
 const ACTIVE_REPO_DAYS = 60;
-// GitHub ends a job that waited 24 h for a runner; anything older is a run GitHub will never start.
+// GitHub ends a job that waited 24 h for a runner; a run queued longer will never start.
 const STUCK_MS = DAY;
-const RANK = { queued: 0, waiting: 0, in_progress: 1, completed: 2 };
+// The sweep shares the OAuth app's hourly budget with ci.js (which stops at 200).
+const RATE_FLOOR = 1500;
+const MAX_JOB_CALLS = 300;
+const PAGES = 5;
+// Jobs not yet given a runner: requested, pending (concurrency group), waiting (environment approval), queued.
+const RANK = { requested: 0, pending: 0, waiting: 0, queued: 0, in_progress: 1, completed: 2 };
 const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 
-const str = (v, n = 200) => (typeof v === 'string' ? v.slice(0, n) : null);
 const id = (v) => (Number.isSafeInteger(v) && v > 0 ? v : null);
 const time = (v) => (typeof v === 'string' && Number.isFinite(Date.parse(v)) ? new Date(v).toISOString().replace(/\.\d{3}Z$/, 'Z') : null);
-const median = (xs) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return s[Math.floor((s.length - 1) / 2)]; };
-const pctile = (xs, p) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
-export const labelKey = (labels) => JSON.stringify([...labels].sort());
+const labelKey = (labels) => JSON.stringify([...labels].sort());
 const hostedLabels = (labels) => labels.length > 0 && labels.every((l) => /^(ubuntu|windows|macos)-/i.test(l));
 
 // One workflow job, from a webhook payload or the REST API (same shape).
@@ -37,17 +40,18 @@ function cleanJob(j, repo) {
     id: jobId, runId: id(j.run_id), attempt: id(j.run_attempt) || 1, repo: repo.full_name, private: repo.private !== false,
     workflow: str(j.workflow_name), name: str(j.name, 300) || '—', status, conclusion: str(j.conclusion, 20),
     labels: Array.isArray(j.labels) ? j.labels.slice(0, 12).map((l) => str(l, 60)).filter(Boolean) : [],
-    createdAt: time(j.created_at), startedAt: status === 'queued' || status === 'waiting' ? null : time(j.started_at), completedAt: time(j.completed_at),
+    createdAt: time(j.created_at), startedAt: RANK[status] === 0 ? null : time(j.started_at), completedAt: time(j.completed_at),
     runner: str(j.runner_name, 100), runnerGroup: str(j.runner_group_name, 100), branch: str(j.head_branch), url: str(j.html_url, 300),
   };
 }
 
 export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github = null, token = null, fetcher = fetch, clock = Date.now, log = () => {} }) {
   const path = join(dataDir, 'ci', 'org-queue.json');
-  const st = { jobs: {}, done: [], served: {}, stuck: [], since: null, lastEventAt: null, sweep: null, rate: null, ...readJSON(path, {}) };
+  // served: label set -> last start by any job (`all`) and by a public-repository job (`pub`).
+  const st = { jobs: {}, done: [], served: {}, stuck: [], since: null, lastEventAt: null, lastPublicEventAt: null, sweep: null, rate: null, ...readJSON(path, {}) };
   let saveTimer = null;
-  const save = () => { clearTimeout(saveTimer); saveTimer = setTimeout(() => writeAtomic(path, JSON.stringify(st)), 1000); saveTimer.unref?.(); };
   const flush = () => { clearTimeout(saveTimer); writeAtomic(path, JSON.stringify(st)); };
+  const save = () => { clearTimeout(saveTimer); saveTimer = setTimeout(flush, 1000); saveTimer.unref?.(); };
   const iso = () => new Date(clock()).toISOString();
 
   function verify(raw, header) {
@@ -63,7 +67,10 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     const prior = st.jobs[key];
     if (prior && RANK[prior.status] > RANK[job.status]) return false;
     if (st.done.some((d) => d.id === job.id)) return false;
-    if (job.startedAt && job.runnerGroup) st.served[labelKey(job.labels)] = { at: job.startedAt, hosted: job.runnerGroup === 'GitHub Actions' };
+    if (job.startedAt && job.runnerGroup) {
+      const k = labelKey(job.labels), s = { at: job.startedAt, hosted: job.runnerGroup === 'GitHub Actions' };
+      st.served[k] = { ...st.served[k], all: s, ...(job.private ? {} : { pub: s }) };
+    }
     if (job.status === 'completed') {
       delete st.jobs[key];
       st.done.push({ id: job.id, repo: job.repo, private: job.private, labels: job.labels, createdAt: job.createdAt || prior?.createdAt || null,
@@ -77,7 +84,7 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
   function prune() {
     const now = clock();
     st.done = st.done.filter((d) => Date.parse(d.completedAt) > now - DAY).slice(-10_000);
-    for (const [k, s] of Object.entries(st.served)) if (Date.parse(s.at) < now - 30 * DAY) delete st.served[k];
+    for (const [k, s] of Object.entries(st.served)) if (!s.all || Date.parse(s.all.at) < now - 30 * DAY) delete st.served[k];
   }
 
   // Returns true when the queue changed.
@@ -87,6 +94,7 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     const job = cleanJob(body?.workflow_job, body?.repository);
     if (!job) throw new Error('not a workflow_job event');
     st.lastEventAt = iso();
+    if (!job.private) st.lastPublicEventAt = st.lastEventAt;
     st.since ||= st.lastEventAt;
     const changed = apply(job, st.lastEventAt);
     prune();
@@ -96,7 +104,7 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
 
   // ---- sweep ---------------------------------------------------------------
   async function api(p) {
-    if (st.rate && st.rate.remaining < 500 && st.rate.reset * 1000 > clock()) throw new Error('GitHub rate limit low; waiting for reset');
+    if (st.rate && st.rate.remaining < RATE_FLOOR && st.rate.reset * 1000 > clock()) throw new Error('GitHub rate limit low; waiting for reset');
     const auth = token ? `Bearer ${token}` : github ? `Basic ${Buffer.from(`${github.id}:${github.secret}`).toString('base64')}` : null;
     const r = await fetcher(`https://api.github.com${p}`, {
       headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'dash-status', 'X-GitHub-Api-Version': '2022-11-28', ...(auth ? { Authorization: auth } : {}) },
@@ -107,6 +115,17 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     if (!r.ok) throw new Error(`GitHub ${r.status} for ${p.split('?')[0]}`);
     return r.json();
   }
+  // Up to PAGES pages of a list; `complete` is false when there may be more.
+  async function pages(p, key) {
+    const items = [];
+    for (let page = 1; page <= PAGES; page++) {
+      const v = await api(`${p}&per_page=100&page=${page}`);
+      const list = key ? v?.[key] || [] : v || [];
+      items.push(...list);
+      if (list.length < 100) return { items, complete: true };
+    }
+    return { items, complete: false };
+  }
 
   async function sweep() {
     const started = clock();
@@ -114,48 +133,55 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     st.since ||= startedAt;
     const cutoff = started - ACTIVE_REPO_DAYS * DAY;
     const repos = new Map(); // full_name -> repository object
-    for (let page = 1; page <= 10; page++) {
-      const list = await api(`/orgs/${org}/repos?type=${token ? 'all' : 'public'}&per_page=100&page=${page}`);
-      for (const r of list) if (!r.archived && Date.parse(r.pushed_at) > cutoff) repos.set(r.full_name, { full_name: r.full_name, private: r.private });
-      if (list.length < 100) break;
+    for (const r of (await pages(`/orgs/${org}/repos?type=${token ? 'all' : 'public'}`)).items) {
+      if (!r.archived && Date.parse(r.pushed_at) > cutoff) repos.set(r.full_name, { full_name: r.full_name, private: r.private });
     }
     // A job we already track is checked even if its repository is quiet.
     for (const j of Object.values(st.jobs)) if (!repos.has(j.repo) && (token || !j.private)) repos.set(j.repo, { full_name: j.repo, private: j.private });
 
-    const seen = new Set(), stuck = [], covered = new Set();
-    let error = null;
+    // covered: repositories whose every active job the sweep saw, so a tracked job missing there has finished.
+    const seen = new Set(), stuck = [], covered = new Set(), stuckRuns = new Set();
+    let error = null, jobCalls = 0;
     for (const repo of repos.values()) {
       try {
         const runs = new Map();
-        for (const status of ['queued', 'waiting', 'pending', 'in_progress']) {
-          for (const r of (await api(`/repos/${repo.full_name}/actions/runs?status=${status}&per_page=100`))?.workflow_runs || []) runs.set(r.id, r);
+        let complete = true;
+        for (const status of ['requested', 'queued', 'waiting', 'pending', 'in_progress']) {
+          const res = await pages(`/repos/${repo.full_name}/actions/runs?status=${status}`, 'workflow_runs');
+          for (const r of res.items) runs.set(r.id, r);
+          complete &&= res.complete;
         }
         for (const run of runs.values()) {
-          if (Date.parse(run.created_at) < started - STUCK_MS && run.status !== 'in_progress') {
+          // A re-run keeps created_at; run_started_at is the current attempt. Approval waits may last weeks.
+          const since = run.run_started_at || run.created_at;
+          if (Date.parse(since) < started - STUCK_MS && !['in_progress', 'waiting'].includes(run.status)) {
             stuck.push({ repo: repo.full_name, private: repo.private, runId: run.id, workflow: str(run.name), status: str(run.status, 20), event: str(run.event, 40),
-              branch: str(run.head_branch), createdAt: time(run.created_at), url: str(run.html_url, 300) });
+              branch: str(run.head_branch), createdAt: time(since), url: str(run.html_url, 300) });
+            stuckRuns.add(run.id);
             continue;
           }
-          const v = await api(`/repos/${repo.full_name}/actions/runs/${run.id}/jobs?filter=latest&per_page=100`);
-          for (const raw of v?.jobs || []) {
+          if (jobCalls >= MAX_JOB_CALLS) { complete = false; continue; }
+          jobCalls++;
+          const res = await pages(`/repos/${repo.full_name}/actions/runs/${run.id}/jobs?filter=latest`, 'jobs');
+          complete &&= res.complete;
+          for (const raw of res.items) {
             const job = cleanJob({ ...raw, workflow_name: raw.workflow_name || run.name, head_branch: raw.head_branch || run.head_branch }, repo);
             if (!job) continue;
             seen.add(job.id);
             apply(job, startedAt);
           }
         }
-        covered.add(repo.full_name);
+        if (complete) covered.add(repo.full_name);
       } catch (e) { error = `${repo.full_name}: ${e.message}`; if (/rate limit/.test(e.message)) break; }
     }
     // A job the sweep could see but did not find has finished; its completion event was lost.
     for (const [k, j] of Object.entries(st.jobs)) {
-      if (covered.has(j.repo) && !seen.has(j.id) && Date.parse(j.seenAt) < started) delete st.jobs[k];
+      if (covered.has(j.repo) && !seen.has(j.id) && !stuckRuns.has(j.runId) && Date.parse(j.seenAt) < started) delete st.jobs[k];
     }
-    st.stuck = stuck.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    // Repositories the sweep did not reach keep their earlier stuck runs.
+    const reached = new Set(stuck.map((r) => r.repo).concat([...covered]));
+    st.stuck = [...stuck, ...st.stuck.filter((r) => !reached.has(r.repo))].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     st.sweep = { at: startedAt, ms: clock() - started, repos: covered.size, scope: token ? 'all' : 'public', error };
-    expire();
-    prune();
-    flush();
   }
 
   // Jobs the sweep cannot check (private repositories without a token) end on their own.
@@ -169,55 +195,57 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
 
   let ticking = false;
   async function tick() {
-    if (ticking || !(token || github)) return false;
-    if (st.sweep && clock() - Date.parse(st.sweep.at) < SWEEP_MS) return false;
+    if (ticking) return false;
+    const due = (token || github) && (!st.sweep || clock() - Date.parse(st.sweep.at) >= SWEEP_MS);
+    if (!due) { expire(); prune(); return false; }
     ticking = true;
-    try { await sweep(); return true; } catch (e) { log('ci queue sweep:', e.message); st.sweep = { ...st.sweep, at: iso(), error: e.message }; return false; } finally { ticking = false; }
+    try { await sweep(); return true; } catch (e) { log('ci queue sweep:', e.message); st.sweep = { ...st.sweep, at: iso(), error: e.message }; return false; } finally { expire(); prune(); flush(); ticking = false; }
   }
 
   // ---- view ----------------------------------------------------------------
   // Signed out: public repositories only, without branches, links or runner names.
   function summary({ full = false } = {}) {
-    const now = clock();
     const keep = (x) => full || !x.private;
     const waiting = Object.values(st.jobs).filter((j) => j.status !== 'in_progress' && keep(j)).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const running = Object.values(st.jobs).filter((j) => j.status === 'in_progress' && keep(j)).sort((a, b) => (a.startedAt || '').localeCompare(b.startedAt || ''));
-    // Skipped jobs (an `if:` was false) never wait for a runner.
+    // Skipped jobs (an `if:` was false) never wait for a runner; cancelled ones may never have reached one.
     const done = st.done.filter((d) => keep(d) && d.conclusion !== 'skipped');
-    const waitSec = (d) => (d.startedAt && d.createdAt ? Math.max(0, (Date.parse(d.startedAt) - Date.parse(d.createdAt)) / 1000) : null);
-    const waits = done.map(waitSec).filter((x) => x != null);
+    const waitSec = (d) => (d.conclusion !== 'cancelled' && d.startedAt && d.createdAt ? Math.max(0, (Date.parse(d.startedAt) - Date.parse(d.createdAt)) / 1000) : null);
+    const stuck = st.stuck.filter(keep);
 
     const groups = new Map();
     const group = (labels) => {
       const k = labelKey(labels);
       if (!groups.has(k)) {
-        const served = st.served[k];
+        const served = st.served[k]?.[full ? 'all' : 'pub'];
         groups.set(k, { key: k, labels: [...labels].sort(), hosted: served ? served.hosted : hostedLabels(labels), lastStartedAt: served?.at || null, waiting: 0, oldestWaitingAt: null, running: 0, finished24h: 0, waits: [] });
       }
       return groups.get(k);
     };
+    const waits = [];
     for (const j of waiting) { const g = group(j.labels); g.waiting++; g.oldestWaitingAt ||= j.createdAt; }
     for (const j of running) group(j.labels).running++;
-    for (const d of done) { const g = group(d.labels); g.finished24h++; const w = waitSec(d); if (w != null) g.waits.push(w); }
+    for (const d of done) { const g = group(d.labels); g.finished24h++; const w = waitSec(d); if (w != null) { g.waits.push(w); waits.push(w); } }
     const labels = [...groups.values()].map(({ waits: w, ...g }) => ({ ...g, medianWaitSec: median(w), p90WaitSec: pctile(w, 0.9) }))
       .sort((a, b) => b.waiting - a.waiting || b.running - a.running || b.finished24h - a.finished24h);
 
     const view = (j) => ({ id: j.id, repo: j.repo, workflow: j.workflow, name: j.name, status: j.status, labels: j.labels, createdAt: j.createdAt, startedAt: j.startedAt,
       ...(full ? { private: j.private, runner: j.runner, runnerGroup: j.runnerGroup, branch: j.branch, url: j.url || (j.runId ? `https://github.com/${j.repo}/actions/runs/${j.runId}` : null) } : {}) });
     return {
-      public: !full, at: new Date(now).toISOString(), org,
+      public: !full, at: iso(), org,
       configured: { webhook: !!secret, sweep: token ? 'all' : github ? 'public' : null },
-      since: st.since, lastEventAt: st.lastEventAt, sweep: st.sweep && { at: st.sweep.at, repos: st.sweep.repos, scope: st.sweep.scope, ...(full ? { error: st.sweep.error, rate: st.rate } : {}) },
+      since: st.since, lastEventAt: full ? st.lastEventAt : st.lastPublicEventAt,
+      sweep: st.sweep && { at: st.sweep.at, scope: st.sweep.scope, ...(full ? { repos: st.sweep.repos, error: st.sweep.error, rate: st.rate } : {}) },
       totals: {
         waiting: waiting.length, oldestWaitingAt: waiting[0]?.createdAt || null, running: running.length,
-        finished24h: done.length, medianWaitSec24h: median(waits), p90WaitSec24h: pctile(waits, 0.9), stuck: st.stuck.filter(keep).length,
+        finished24h: done.length, medianWaitSec24h: median(waits), p90WaitSec24h: pctile(waits, 0.9), stuck: stuck.length,
       },
       labels,
       waiting: waiting.slice(0, 500).map(view),
       running: running.slice(0, 500).map(view),
-      stuck: st.stuck.filter(keep).map((r) => ({ repo: r.repo, workflow: r.workflow, status: r.status, event: r.event, createdAt: r.createdAt, ...(full ? { branch: r.branch, url: r.url } : {}) })),
+      stuck: stuck.map((r) => ({ repo: r.repo, workflow: r.workflow, status: r.status, event: r.event, createdAt: r.createdAt, ...(full ? { branch: r.branch, url: r.url } : {}) })),
     };
   }
 
-  return { verify, webhook, tick, sweep, summary, flush, configured: () => !!secret };
+  return { verify, webhook, tick, summary, flush, configured: () => !!secret };
 }
