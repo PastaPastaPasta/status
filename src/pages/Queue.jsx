@@ -6,6 +6,7 @@ import { CiTabs } from './CI.jsx';
 // Waiting longer than this for one label set means its runners are short or gone.
 const SLOW_SEC = 15 * 60;
 const labelKey = (labels) => JSON.stringify([...labels].sort());
+const HOLD = { waiting: ['approval', "waiting for a deployment environment's approval or wait timer"], pending: ['concurrency', 'waiting for another run in the same concurrency group to finish'] };
 
 export default function Queue() {
   const session = useSession();
@@ -20,14 +21,15 @@ export default function Queue() {
   const age = (ts) => (now - Date.parse(ts)) / 1000;
   const live = data.configured.webhook || data.configured.sweep;
   const show = (j) => (!repo || j.repo === repo) && (!labels || labelKey(j.labels) === labels);
-  const waiting = data.waiting.filter(show), running = data.running.filter(show);
-  const repos = [...new Set([...data.waiting, ...data.running].map((j) => j.repo))].sort();
+  const waiting = data.waiting.filter(show), held = data.held.filter(show), running = data.running.filter(show);
+  const repos = [...new Set([...data.waiting, ...data.held, ...data.running].map((j) => j.repo))].sort();
+  const queuedAt = (j) => j.queuedAt || j.createdAt;
   const filtered = repo || labels;
   return (
     <div>
       <div className="mt-5 flex flex-wrap items-baseline gap-x-3">
         <h1 className="text-[16px] font-semibold">Actions queue</h1>
-        <span className="text-dim text-[12px]">every {data.org} workflow job waiting for a runner or running now, GitHub-hosted and self-hosted</span>
+        <span className="text-dim text-[12px]">every {data.org} workflow job waiting, held or running now, GitHub-hosted and self-hosted</span>
         <CiTabs active="queue" />
       </div>
       {data.public && <div className="mt-2 text-[12px] text-dim">Public view: public repositories only; branches, links and runner names are left out. {session.user ? 'Your account has no access to more.' : 'Sign in for details.'}</div>}
@@ -35,11 +37,12 @@ export default function Queue() {
         <div className="mt-3"><Empty>The Actions queue is not set up yet: the server has neither the org webhook secret nor GitHub API credentials.</Empty></div>
       ) : (
         <>
-          <div className="mt-3 grid gap-2 grid-cols-2 md:grid-cols-3 xl:grid-cols-5">
+          <div className="mt-3 grid gap-2 grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
             <Stat label="Waiting for a runner" value={t.waiting} level={t.oldestWaitingAt && age(t.oldestWaitingAt) > SLOW_SEC ? 'warn' : undefined}
-              sub={t.oldestWaitingAt ? `oldest ${ago(t.oldestWaitingAt, now)}` : 'none'} />
+              sub={t.oldestWaitingAt ? `oldest ${ago(t.oldestWaitingAt, now)}` : 'none'} title="Queued jobs that have asked for a runner and not got one yet" />
+            <Stat label="Held" value={t.held} sub={`${t.approval} approval · ${t.concurrency} concurrency`} title="Jobs not yet asking for a runner: waiting for an environment approval or for another run in their concurrency group" />
             <Stat label="Running now" value={t.running} sub={`${data.labels.filter((g) => g.running).length} runner label sets`} />
-            <Stat label="Wait · 24h" value={secs(t.medianWaitSec24h)} sub={t.p90WaitSec24h != null ? `p90 ${secs(t.p90WaitSec24h)}` : 'median, queued → started'} level={t.p90WaitSec24h > SLOW_SEC ? 'warn' : undefined} />
+            <Stat label="Runner wait · 24h" value={secs(t.medianWaitSec24h)} sub={t.p90WaitSec24h != null ? `p90 ${secs(t.p90WaitSec24h)}` : 'median, queued → started'} title="From queued (after any approval or concurrency hold) to started" level={t.p90WaitSec24h > SLOW_SEC ? 'warn' : undefined} />
             <Stat label="Finished · 24h" value={t.finished24h} sub={data.since ? `recording for ${ago(data.since, now)}` : 'nothing recorded yet'} title={data.since ? `since ${clock(data.since)}` : undefined} />
             <Stat label="Stuck runs" value={t.stuck} level={t.stuck ? 'warn' : undefined} sub="queued > 24 h" title="Runs queued for over 24 hours. GitHub will not start them; cancel them from the run page." />
           </div>
@@ -47,7 +50,7 @@ export default function Queue() {
           <Section title="By runner labels" right={<span className="text-dim text-[11px]">select a row to filter the lists below</span>}>
             <div className="panel overflow-x-auto max-h-[360px]">
               <table className="grid w-full text-[12px]">
-                <thead><tr><th>runs-on labels</th><th>Runners</th><th className="text-right">Waiting</th><th className="text-right">Oldest wait</th><th className="text-right">Running</th><th className="text-right">Median wait · 24h</th><th className="text-right">p90</th><th className="text-right">Jobs · 24h</th><th>Last picked up</th></tr></thead>
+                <thead><tr><th>runs-on labels</th><th>Runners</th><th className="text-right">Waiting</th><th className="text-right">Oldest wait</th><th className="text-right">Held</th><th className="text-right">Running</th><th className="text-right">Median wait · 24h</th><th className="text-right">p90</th><th className="text-right">Jobs · 24h</th><th>Last picked up</th></tr></thead>
                 <tbody>
                   {data.labels.map((g) => {
                     const oldest = g.oldestWaitingAt ? age(g.oldestWaitingAt) : null;
@@ -59,6 +62,7 @@ export default function Queue() {
                         <td className="text-dim">{g.hosted ? 'GitHub-hosted' : 'self-hosted'}</td>
                         <td className={`mono text-right ${g.waiting ? 'lv-warn' : 'text-dim'}`}>{g.waiting}</td>
                         <td className={`mono text-right ${oldest > SLOW_SEC ? 'lv-warn' : ''}`}>{oldest != null ? ago(g.oldestWaitingAt, now) : '—'}</td>
+                        <td className="mono text-right">{g.held || <span className="text-dim">0</span>}</td>
                         <td className="mono text-right">{g.running || <span className="text-dim">0</span>}</td>
                         <td className="mono text-right">{secs(g.medianWaitSec)}</td>
                         <td className={`mono text-right ${g.p90WaitSec > SLOW_SEC ? 'lv-warn' : ''}`}>{secs(g.p90WaitSec)}</td>
@@ -82,9 +86,9 @@ export default function Queue() {
                 <tbody>
                   {waiting.map((j) => (
                     <tr key={j.id}>
-                      <td className={`mono ${age(j.createdAt) > SLOW_SEC ? 'lv-warn' : ''}`} title={clock(j.createdAt)}>{ago(j.createdAt, now)}</td>
+                      <td className={`mono ${age(queuedAt(j)) > SLOW_SEC ? 'lv-warn' : ''}`} title={`queued ${clock(queuedAt(j))}`}>{ago(queuedAt(j), now)}</td>
                       <td className="mono">{j.repo}{j.private && <span className="tag ml-1.5">private</span>}</td>
-                      <td className="max-w-[460px] truncate"><JobLink j={j} />{j.status === 'waiting' && <span className="tag ml-1.5" title="waiting for a deployment environment's approval or wait timer">approval</span>}</td>
+                      <td className="max-w-[460px] truncate"><JobLink j={j} /><Unverified j={j} /></td>
                       <td className="mono text-dim">{j.labels.join(', ')}</td>
                       {!data.public && <td className="mono text-dim max-w-[220px] truncate">{j.branch || '—'}</td>}
                     </tr>
@@ -95,6 +99,29 @@ export default function Queue() {
             </div>
           </Section>
 
+          {data.held.length > 0 && (
+            <Section title={`Held before asking for a runner (${held.length}${filtered ? ` of ${data.held.length}` : ''})`} right={<span className="text-dim text-[11px]">not runner capacity: an approval or a concurrency group</span>}>
+              <div className="panel overflow-x-auto max-h-[320px]">
+                <table className="grid w-full text-[12px]">
+                  <thead><tr><th>Held for</th><th>Repository</th><th>Workflow · job</th><th>Waiting on</th><th>Labels</th>{!data.public && <th>Branch</th>}</tr></thead>
+                  <tbody>
+                    {held.map((j) => (
+                      <tr key={j.id}>
+                        <td className="mono" title={clock(j.createdAt)}>{ago(j.createdAt, now)}</td>
+                        <td className="mono">{j.repo}{j.private && <span className="tag ml-1.5">private</span>}</td>
+                        <td className="max-w-[420px] truncate"><JobLink j={j} /><Unverified j={j} /></td>
+                        <td className="text-dim" title={HOLD[j.status]?.[1]}>{HOLD[j.status]?.[0] || j.status}</td>
+                        <td className="mono text-dim">{j.labels.join(', ')}</td>
+                        {!data.public && <td className="mono text-dim max-w-[200px] truncate">{j.branch || '—'}</td>}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {!held.length && <div className="p-4 text-dim text-center">No held job matches the filter.</div>}
+              </div>
+            </Section>
+          )}
+
           <Section title={`Running (${running.length}${filtered ? ` of ${data.running.length}` : ''})`}>
             <div className="panel overflow-x-auto max-h-[420px]">
               <table className="grid w-full text-[12px]">
@@ -104,7 +131,7 @@ export default function Queue() {
                     <tr key={j.id}>
                       <td className="mono" title={j.startedAt ? clock(j.startedAt) : undefined}>{j.startedAt ? ago(j.startedAt, now) : '—'}</td>
                       <td className="mono">{j.repo}{j.private && <span className="tag ml-1.5">private</span>}</td>
-                      <td className="max-w-[420px] truncate"><JobLink j={j} /></td>
+                      <td className="max-w-[420px] truncate"><JobLink j={j} /><Unverified j={j} /></td>
                       {!data.public && <td className="mono text-dim max-w-[220px] truncate" title={j.runnerGroup || undefined}>{j.runner || '—'}</td>}
                       <td className="mono text-dim">{j.labels.join(', ')}</td>
                       {!data.public && <td className="mono text-dim max-w-[200px] truncate">{j.branch || '—'}</td>}
@@ -144,9 +171,14 @@ export default function Queue() {
         {data.sweep ? `Swept ${data.sweep.repos != null ? `${data.sweep.repos} ` : ''}active ${data.sweep.scope === 'all' ? '' : 'public '}repositories ${ago(data.sweep.at, now)} ago.` : data.configured.sweep ? 'First sweep pending.' : ''}
         {data.sweep?.error ? ` Last sweep error: ${data.sweep.error}.` : ''}
         {data.sweep?.rate ? ` ${data.sweep.rate.remaining} GitHub requests left this hour.` : ''}
+        {t.unverified ? ` ${t.unverified} job${t.unverified === 1 ? '' : 's'} not updated for over 2 hours (marked unverified).` : ''}
       </div>
     </div>
   );
+}
+
+function Unverified({ j }) {
+  return j.stale ? <span className="tag ml-1.5 lv-warn" title="No update from GitHub for over 2 hours (the sweep cannot read this repository); it may have finished.">unverified</span> : null;
 }
 
 function JobLink({ j }) {

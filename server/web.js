@@ -53,9 +53,9 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
     const event = req.get('x-github-event');
     if (event === 'ping') return res.json({ ok: true });
     try {
-      const changed = orgQueue.webhook(event, JSON.parse(req.body.toString('utf8')));
-      if (changed) pushQueue();
-      res.status(changed ? 200 : 202).json({ ok: true });
+      const scope = orgQueue.webhook(event, JSON.parse(req.body.toString('utf8')));
+      pushQueue(scope);
+      res.status(scope ? 200 : 202).json({ ok: true });
     } catch (e) { res.status(400).json({ error: e.message }); }
   });
   app.use('/api', rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: true, legacyHeaders: false }));
@@ -164,9 +164,14 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
     for (const c of clients) if (filter(c)) c.res.write(data);
   };
   const debounce = new Map();
-  const pushQueue = () => {
-    clearTimeout(debounce.get('ci-queue'));
-    debounce.set('ci-queue', setTimeout(() => push('ci-queue', { at: new Date(clock()).toISOString() }), 1000));
+  // A change to a private job is announced to members only: its timing is private too.
+  const pushQueue = (scope) => {
+    if (!scope) return;
+    for (const members of scope === 'all' ? [true, false] : [true]) {
+      const key = `ci-queue|${members}`;
+      clearTimeout(debounce.get(key));
+      debounce.set(key, setTimeout(() => push('ci-queue', { at: new Date(clock()).toISOString() }, (c) => !!memberOf(settings, c.user) === members), 1000));
+    }
   };
   function onStateFile(file) {
     const name = file.replace(/\.json$/, '');
@@ -425,7 +430,7 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
   app.use((error, req, res, next) => { if (res.headersSent) return next(error); res.status([400, 413].includes(error.status) ? error.status : 500).json({ error: error.status === 413 ? 'Request body too large' : 'Request could not be processed' }); });
   app.close = () => { for (const w of watchers) w.close(); for (const c of clients) c.res.end(); orgQueue.flush(); };
   app.ci = ci;
-  app.tickQueue = () => orgQueue.tick().then((changed) => { if (changed) pushQueue(); });
+  app.tickQueue = () => orgQueue.tick().then(pushQueue);
   return app;
 }
 

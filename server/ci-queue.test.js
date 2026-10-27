@@ -31,8 +31,8 @@ test('webhook signatures are checked against the exact body', () => {
 
 test('jobs move from waiting to running to finished, never backwards', () => {
   const q = createOrgQueue({ dataDir: dir(), secret: 's', clock: () => T0 });
-  assert.equal(q.webhook('workflow_job', event(job(1, 'queued'))), true);
-  assert.equal(q.webhook('workflow_job', event(job(2, 'queued', { labels: ['dash-x64-light'] }))), true);
+  assert.equal(q.webhook('workflow_job', event(job(1, 'queued'))), 'all');
+  assert.equal(q.webhook('workflow_job', event(job(2, 'queued', { labels: ['dash-x64-light'] }))), 'all');
   let s = q.summary({ full: true });
   assert.equal(s.totals.waiting, 2);
   assert.deepEqual(s.waiting.map((j) => j.id), [1, 2]);
@@ -110,7 +110,7 @@ test('the sweep backfills, drops jobs whose completion was lost, and lists stuck
   q.webhook('workflow_job', event(job(6, 'queued'), repo('dashpay/private', true)));
   now += 60_000;
 
-  assert.equal(await q.tick(), true);
+  assert.equal(await q.tick(), 'all');
   assert.match(calls[0].url, /\/orgs\/dashpay\/repos\?type=public/);
   assert.match(calls[0].auth, /^Basic /);
   assert.ok(!calls.some((c) => c.url.includes('dashpay/old') || c.url.includes('dashpay/gone')), 'archived and quiet repositories are skipped');
@@ -164,15 +164,16 @@ test('review regressions: re-runs, approval waits, long matrices and pending job
   const q = createOrgQueue({ dataDir: dir(), secret: 's', github: { id: 'c', secret: 's' }, fetcher, clock: () => now });
   q.webhook('workflow_job', event(job(641, 'queued', { run_id: 1 })));      // on page 2 of the matrix
   q.webhook('workflow_job', event(job(950, 'queued', { run_id: 3 })));      // belongs to a stuck run: kept, not judged
-  assert.equal(q.webhook('workflow_job', event(job(960, 'pending'))), true); // waiting on a concurrency group
+  assert.equal(q.webhook('workflow_job', event(job(960, 'pending'))), 'all'); // waiting on a concurrency group
   now += 60_000;
   await q.tick();
   const s = q.summary({ full: true });
   assert.deepEqual(s.stuck.map((r) => r.workflow), ['Ghost'], 'neither the re-run nor the approval wait is stuck');
   const ids = new Set(s.waiting.map((j) => j.id));
-  for (const want of [641, 649, 900]) assert.ok(ids.has(want), `job ${want} is still waiting`);
+  for (const want of [641, 649]) assert.ok(ids.has(want), `job ${want} is still waiting`);
+  assert.deepEqual(s.held.map((j) => j.id), [900], 'the approval wait is held, not waiting for a runner');
   assert.equal(ids.has(960), false, 'a pending job the covered sweep no longer sees has finished');
-  assert.equal(s.totals.waiting, 150 + 1, 'job 950 is shown with its stuck run, not as waiting');
+  assert.equal(s.totals.waiting, 150, 'job 950 is shown with its stuck run, not as waiting');
 });
 
 test('the public view does not reveal private activity through aggregates', async () => {
@@ -219,8 +220,59 @@ test('a failed save is logged and the sweep keeps running', async () => {
   const q = createOrgQueue({ dataDir, github: { id: 'c', secret: 's' }, fetcher, clock: () => now, log: (...a) => logs.push(a.join(' ')) });
   rmSync(join(dataDir, 'ci'), { recursive: true, force: true });
   writeFileSync(join(dataDir, 'ci'), 'not a directory');
-  assert.equal(await q.tick(), true);
+  assert.equal(await q.tick(), 'all');
   assert.match(logs.join('\n'), /ci queue save:/);
   now += 20 * 60_000;
-  assert.equal(await q.tick(), true, 'not stuck after a failed save');
+  assert.equal(await q.tick(), 'all', 'not stuck after a failed save');
+});
+
+test('held jobs are counted apart, and runner wait starts when a hold ends', () => {
+  let now = T0 - 60 * 60_000;
+  const q = createOrgQueue({ dataDir: dir(), secret: 's', clock: () => now });
+  const created = iso(T0 - 60 * 60_000);
+  q.webhook('workflow_job', event(job(1, 'pending', { created_at: created })));
+  q.webhook('workflow_job', event(job(2, 'waiting', { created_at: created })));
+  q.webhook('workflow_job', event(job(3, 'queued', { created_at: created })));
+  let s = q.summary({ full: true });
+  assert.deepEqual([s.totals.waiting, s.totals.held, s.totals.approval, s.totals.concurrency], [1, 2, 1, 1]);
+  assert.deepEqual([s.labels[0].waiting, s.labels[0].held], [1, 2]);
+  now = T0 - 30 * 60_000; // the concurrency group frees up
+  q.webhook('workflow_job', event(job(1, 'queued', { created_at: created })));
+  assert.equal(q.summary({ full: true }).waiting.find((j) => j.id === 1).queuedAt, new Date(now).toISOString());
+  now = T0;
+  q.webhook('workflow_job', event(job(1, 'completed', { created_at: created, started_at: iso(T0 - 20 * 60_000), completed_at: iso(T0) })));
+  s = q.summary({ full: true });
+  assert.equal(s.totals.medianWaitSec24h, 600, '10 min on the runner queue, not the 40 min since the job was created');
+});
+
+test('approval waits stay visible, marked unverified, instead of disappearing', () => {
+  let now = T0;
+  const q = createOrgQueue({ dataDir: dir(), secret: 's', clock: () => now });
+  q.webhook('workflow_job', event(job(1, 'waiting'), repo('dashpay/private', true)));
+  now += 37 * 3_600_000;
+  q.tick();
+  let s = q.summary({ full: true });
+  assert.equal(s.held.length, 1);
+  assert.equal(s.held[0].stale, true);
+  assert.equal(s.totals.unverified, 1);
+  now += 40 * 86_400_000; // longer than any workflow run can last
+  q.tick();
+  s = q.summary({ full: true });
+  assert.equal(s.held.length, 0);
+});
+
+test('private activity changes neither public timestamps nor public notices', async () => {
+  let now = T0;
+  const q = createOrgQueue({ dataDir: dir(), secret: 's', clock: () => now });
+  assert.equal(q.webhook('workflow_job', event(job(1, 'queued'), repo('dashpay/private', true))), 'members');
+  assert.equal(q.summary().since, null);
+  assert.equal(q.summary().lastEventAt, null);
+  assert.ok(q.summary({ full: true }).since);
+  now += 60_000;
+  assert.equal(q.webhook('workflow_job', event(job(2, 'queued'))), 'all');
+  assert.equal(q.summary().since, new Date(now).toISOString());
+  assert.equal(q.webhook('workflow_job', event(job(2, 'queued'))), 'all', 'a repeat still refreshes, but reveals only public timing');
+  q.webhook('workflow_job', event(job(2, 'completed')));
+  now += 40 * 86_400_000;
+  assert.equal(await q.tick(), 'members', 'dropping an old private job is announced to members only');
 });
