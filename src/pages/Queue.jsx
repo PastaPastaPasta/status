@@ -50,7 +50,7 @@ export default function Queue() {
           <Section title="By runner labels" right={<span className="text-dim text-[11px]">select a row to filter the lists below</span>}>
             <div className="panel overflow-x-auto max-h-[360px]">
               <table className="grid w-full text-[12px]">
-                <thead><tr><th>runs-on labels</th><th>Runners</th><th className="text-right">Waiting</th><th className="text-right">Oldest wait</th><th className="text-right">Held</th><th className="text-right">Running</th><th className="text-right">Median wait · 24h</th><th className="text-right">p90</th><th className="text-right">Jobs · 24h</th><th>Last picked up</th></tr></thead>
+                <thead><tr><th>runs-on labels</th><th>Runners</th><th className="text-right">Waiting</th><th className="text-right">Oldest wait</th><th className="text-right">Held</th><th className="text-right">Running</th><th className="text-right">Median runner wait · 24h</th><th className="text-right">p90</th><th className="text-right">Jobs · 24h</th><th>Last picked up</th></tr></thead>
                 <tbody>
                   {data.labels.map((g) => {
                     const oldest = g.oldestWaitingAt ? age(g.oldestWaitingAt) : null;
@@ -178,7 +178,7 @@ export default function Queue() {
 }
 
 function Unverified({ j }) {
-  return j.stale ? <span className="tag ml-1.5 lv-warn" title="No update from GitHub for over 2 hours (the sweep cannot read this repository); it may have finished.">unverified</span> : null;
+  return j.stale ? <span className="tag ml-1.5 lv-warn" title="No update from GitHub for over 2 hours (no webhook event, and the sweep could not read it); it may have finished.">unverified</span> : null;
 }
 
 function JobLink({ j }) {

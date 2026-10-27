@@ -276,3 +276,45 @@ test('private activity changes neither public timestamps nor public notices', as
   now += 40 * 86_400_000;
   assert.equal(await q.tick(), 'members', 'dropping an old private job is announced to members only');
 });
+
+test('runner wait never includes a hold, whatever order GitHub reports it in', () => {
+  let now = T0 - 4 * 3_600_000;
+  const q = createOrgQueue({ dataDir: dir(), secret: 's', clock: () => now });
+  const created = iso(now);
+  const send = (id, status, extra = {}) => q.webhook('workflow_job', event(job(id, status, { created_at: created, ...extra })));
+  // requested → approval → queued: the wait starts at queued, not at creation.
+  send(1, 'requested'); send(1, 'waiting');
+  now += 3 * 3_600_000; send(1, 'queued');
+  // A late approval delivery does not move a queued job back.
+  send(1, 'waiting');
+  assert.equal(q.summary({ full: true }).waiting.map((j) => j.id).includes(1), true);
+  // Held, then running with no queued seen: the queue time is unknown and left out.
+  send(2, 'pending');
+  // First seen already running: its hold is unknown too.
+  now += 60_000;
+  send(1, 'in_progress', { started_at: iso(now) });
+  send(2, 'in_progress', { started_at: iso(now) });
+  send(3, 'in_progress', { started_at: iso(now) });
+  for (const id of [1, 2, 3]) send(id, 'completed', { started_at: iso(now), completed_at: iso(now + 60_000) });
+  const s = q.summary({ full: true });
+  assert.equal(s.totals.finished24h, 3);
+  assert.equal(s.totals.medianWaitSec24h, 60, 'only job 1, queued for one minute after a 3 h approval');
+  assert.equal(s.totals.p90WaitSec24h, 60);
+});
+
+test('lost jobs leave the counts once GitHub would have ended them; holds stay', () => {
+  let now = T0;
+  const q = createOrgQueue({ dataDir: dir(), secret: 's', clock: () => now });
+  q.webhook('workflow_job', event(job(1, 'queued', { created_at: iso(now) })));
+  q.webhook('workflow_job', event(job(2, 'in_progress', { created_at: iso(now), started_at: iso(now) })));
+  q.webhook('workflow_job', event(job(3, 'waiting', { created_at: iso(now) })));
+  now += 27 * 3_600_000;
+  q.tick();
+  let s = q.summary({ full: true });
+  assert.deepEqual([s.totals.waiting, s.totals.running, s.totals.held], [0, 1, 1], 'a queued job past 24 h was failed by GitHub');
+  now += 6 * 86_400_000;
+  q.tick();
+  s = q.summary({ full: true });
+  assert.deepEqual([s.totals.waiting, s.totals.running, s.totals.held], [0, 0, 1], 'no job runs longer than 5 days');
+  assert.equal(s.held[0].stale, true);
+});

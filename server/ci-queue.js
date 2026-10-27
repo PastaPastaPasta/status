@@ -22,14 +22,16 @@ const STUCK_MS = DAY;
 const RATE_FLOOR = 1500;
 const MAX_JOB_CALLS = 300;
 const PAGES = 5;
-// Jobs not yet given a runner: requested, pending (concurrency group), waiting (environment approval), queued.
-const RANK = { requested: 0, pending: 0, waiting: 0, queued: 0, in_progress: 1, completed: 2 };
+// Jobs not yet given a runner: requested, pending (concurrency group), waiting (environment approval), then
+// queued once a hold ends. A late hold delivery never moves a queued job back.
+const RANK = { requested: 0, pending: 0, waiting: 0, queued: 0.5, in_progress: 1, completed: 2 };
 // Held before a runner is asked for: a concurrency group (pending) or an environment approval (waiting).
 const HELD = new Set(['pending', 'waiting']);
 // Without an update for this long, a job is shown as unverified: it may have finished unseen.
 const STALE_MS = 2 * HOUR;
-// No workflow run lasts longer; a job not heard of since is dropped.
-const MAX_AGE_MS = 35 * DAY;
+// A job not heard of for STALE_MS is dropped once it is older than GitHub lets it be in its state:
+// queued 24 h, running 5 days (self-hosted), held for an approval 30 days.
+const MAX_AGE = { queued: 26 * HOUR, in_progress: 6 * DAY, held: 35 * DAY };
 const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 
 const id = (v) => (Number.isSafeInteger(v) && v > 0 ? v : null);
@@ -46,7 +48,7 @@ function cleanJob(j, repo) {
     id: jobId, runId: id(j.run_id), attempt: id(j.run_attempt) || 1, repo: repo.full_name, private: repo.private !== false,
     workflow: str(j.workflow_name), name: str(j.name, 300) || '—', status, conclusion: str(j.conclusion, 20),
     labels: Array.isArray(j.labels) ? j.labels.slice(0, 12).map((l) => str(l, 60)).filter(Boolean) : [],
-    createdAt: time(j.created_at), startedAt: RANK[status] === 0 ? null : time(j.started_at), completedAt: time(j.completed_at),
+    createdAt: time(j.created_at), startedAt: RANK[status] < 1 ? null : time(j.started_at), completedAt: time(j.completed_at),
     runner: str(j.runner_name, 100), runnerGroup: str(j.runner_group_name, 100), branch: str(j.head_branch), url: str(j.html_url, 300),
   };
 }
@@ -70,13 +72,16 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
   }
 
   // Deliveries can arrive out of order: a job never moves back to an earlier state.
-  // queuedAt: when it began waiting for a runner, after any concurrency or approval hold.
+  // queuedAt: when it began waiting for a runner, after any concurrency or approval hold; null
+  // when unknown (a hold, or nothing, was seen before it started), so it stays out of wait statistics.
   function apply(job, seenAt) {
     const key = String(job.id);
     const prior = st.jobs[key];
     if (prior && RANK[prior.status] > RANK[job.status]) return false;
     if (st.done.some((d) => d.id === job.id)) return false;
-    const queuedAt = prior?.queuedAt || (HELD.has(job.status) ? null : prior && HELD.has(prior.status) ? seenAt : job.createdAt || seenAt);
+    const wasHeld = HELD.has(job.status) || !!prior?.wasHeld;
+    const queuedAt = HELD.has(job.status) ? null
+      : prior?.queuedAt || (RANK[job.status] >= 1 ? null : wasHeld ? seenAt : job.createdAt || seenAt);
     if (job.startedAt && job.runnerGroup) {
       const k = labelKey(job.labels), s = { at: job.startedAt, hosted: job.runnerGroup === 'GitHub Actions' };
       st.served[k] = { ...st.served[k], all: s, ...(job.private ? {} : { pub: s }) };
@@ -86,7 +91,7 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
       st.done.push({ id: job.id, repo: job.repo, private: job.private, labels: job.labels, createdAt: job.createdAt || prior?.createdAt || null,
         queuedAt, startedAt: job.startedAt || prior?.startedAt || null, completedAt: job.completedAt || seenAt, conclusion: job.conclusion });
     } else {
-      st.jobs[key] = { ...prior, ...job, createdAt: job.createdAt || prior?.createdAt || seenAt, queuedAt, seenAt };
+      st.jobs[key] = { ...prior, ...job, createdAt: job.createdAt || prior?.createdAt || seenAt, queuedAt, wasHeld, seenAt };
     }
     return true;
   }
@@ -206,7 +211,8 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     const now = clock();
     let changed = false;
     for (const [k, j] of Object.entries(st.jobs)) {
-      if (now - Date.parse(j.createdAt) > MAX_AGE_MS && now - Date.parse(j.seenAt) > STALE_MS) { delete st.jobs[k]; changed = changed === 'all' || !j.private ? 'all' : 'members'; }
+      const [from, max] = j.status === 'in_progress' ? [j.startedAt, MAX_AGE.in_progress] : HELD.has(j.status) ? [j.createdAt, MAX_AGE.held] : [j.queuedAt || j.createdAt, MAX_AGE.queued];
+      if (now - Date.parse(from || j.createdAt) > max && now - Date.parse(j.seenAt) > STALE_MS) { delete st.jobs[k]; changed = changed === 'all' || !j.private ? 'all' : 'members'; }
     }
     return changed;
   }
@@ -230,13 +236,13 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     const stuckRuns = new Set(st.stuck.map((r) => r.runId));
     const active = Object.values(st.jobs).filter((j) => keep(j) && !stuckRuns.has(j.runId));
     const since = (j) => j.queuedAt || j.createdAt;
-    const waiting = active.filter((j) => RANK[j.status] === 0 && !HELD.has(j.status)).sort((a, b) => since(a).localeCompare(since(b)));
+    const waiting = active.filter((j) => RANK[j.status] < 1 && !HELD.has(j.status)).sort((a, b) => since(a).localeCompare(since(b)));
     const held = active.filter((j) => HELD.has(j.status)).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const running = active.filter((j) => j.status === 'in_progress').sort((a, b) => (a.startedAt || '').localeCompare(b.startedAt || ''));
     // Skipped jobs (an `if:` was false) never wait for a runner; cancelled ones may never have reached one.
     const done = st.done.filter((d) => keep(d) && d.conclusion !== 'skipped');
-    // Runner wait only: from queued (after any hold) to started.
-    const waitSec = (d) => (d.conclusion !== 'cancelled' && d.startedAt && since(d) ? Math.max(0, (Date.parse(d.startedAt) - Date.parse(since(d))) / 1000) : null);
+    // Runner wait only: from queued (after any hold) to started; unknown queue times are left out.
+    const waitSec = (d) => (d.conclusion !== 'cancelled' && d.startedAt && d.queuedAt ? Math.max(0, (Date.parse(d.startedAt) - Date.parse(d.queuedAt)) / 1000) : null);
     const stuck = st.stuck.filter(keep);
 
     const groups = new Map();

@@ -150,11 +150,13 @@ requests/h). Data is kept in `data/ci/` for 30 days.
 **Actions queue** (`/ci/queue`) lists every workflow job in the org that is waiting
 for a runner or running, on GitHub-hosted and self-hosted runners alike. Jobs held
 before they ask for a runner (an environment approval, or a concurrency group) are
-counted and listed apart, since they say nothing about runner capacity; runner wait
-is measured from when a job was queued after any such hold. Jobs are grouped by
+counted and listed apart, since they say nothing about runner capacity. Runner wait
+is measured from when a job was seen queued after any such hold; jobs first seen
+already running are left out of the wait statistics, since their hold is unknown. Jobs are grouped by
 their `runs-on` labels, with the wait so far, the 24 h median and p90 wait, and when
-a runner last took that label set. A job with no update for 2 hours (only possible
-where the sweep cannot read the repository) is marked unverified rather than dropped. Runs queued for over 24 hours,
+a runner last took that label set. A job with no update for 2 hours (no webhook
+event and no sweep that could read it) is marked unverified, and dropped only once
+older than GitHub allows in its state: queued 24 h, running 5 days, held 30 days. Runs queued for over 24 hours,
 which GitHub will never start, are listed separately so they can be cancelled. Signed out,
 the page shows public repositories only, without branches, links or runner names.
 

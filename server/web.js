@@ -167,6 +167,7 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
   // A change to a private job is announced to members only: its timing is private too.
   const pushQueue = (scope) => {
     if (!scope) return;
+    if (scope === 'all') publicCache.delete('ci-queue');
     for (const members of scope === 'all' ? [true, false] : [true]) {
       const key = `ci-queue|${members}`;
       clearTimeout(debounce.get(key));
