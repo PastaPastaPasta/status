@@ -145,6 +145,14 @@ try {
     host: { hostname: 'fixture.lan', os: 'macOS 26.6.2', arch: 'arm64', cpus: 14, load: [2, 2, 2], memTotal: 38e9, memUsed: 20e9, uptimeSec: 86400, disks: [{ path: '/System/Volumes/Data', total: 5e11, free: 1.2e11 }], docker: null },
     runners: [{ key: '/Users/runner/actions-runner', name: 'mac-runner-fixture', pool: 'platform-repositories', kind: 'native', version: '2.337.0', listening: true, busy: true, job: { name: 'Swift SDK build', start: hour(0.1), repo: 'dashpay/platform', runId: 1, workflow: 'Tests' }, diag: { bytes: 6e9, files: 162880 } }],
     jobs: [3, 5, 9, 30].map((h, i) => ({ runner: '/Users/runner/actions-runner', runnerName: 'mac-runner-fixture', name: 'Swift SDK build', start: hour(h), end: hour(h - 0.1), result: i === 1 ? 'Failed' : 'Succeeded', repo: 'dashpay/platform', runId: 10 + i, attempt: 1, workflow: 'Tests', visibility: 'public' })) });
+  // A dash-ci-pool host: a pool of single-use runners, no long-lived ones.
+  const { id: poolReporter } = app.ci.addReporter('r730-fixture');
+  app.ci.ingest(poolReporter, { v: 1, reporter: '2', python: '3.11.2', at: hour(0),
+    host: { hostname: 'proxmox3', os: 'Debian GNU/Linux 12 (bookworm)', arch: 'x86_64', cpus: 88, load: [6, 5, 5], memTotal: 270e9, memUsed: 120e9, uptimeSec: 864000, disks: [{ path: '/', total: 9e11, free: 4e11 }], docker: null },
+    runners: [],
+    pools: [{ name: 'light', controller: 'r730', backend: 'proxmox-lxc', labels: ['self-hosted', 'Linux', 'X64', 'dash-x64-light'], size: 12, idle: 9, busy: 2, starting: 1, draining: false, at: hour(0),
+      instances: [{ name: 'r730-light-0a1b2c', state: 'busy', since: hour(0.01) }, { name: 'r730-light-3d4e5f', state: 'busy', since: hour(0.02) }] }],
+    jobs: [0.5, 1, 2, 4, 6, 20].map((h, i) => ({ runner: `r730-light-00000${i}`, runnerName: `r730-light-00000${i}`, pool: 'light', name: i % 2 ? 'Validate PR title' : 'Lint', start: hour(h), end: hour(h - 0.01), result: i === 2 ? 'Failed' : 'Succeeded', repo: 'dashpay/dash', runId: 40 + i, attempt: 1, workflow: 'CI', visibility: 'public' })) });
   mkdirSync(join(dataDir, 'aws'), { recursive: true });
   writeFileSync(join(dataDir, 'aws', 'inventory.json'), JSON.stringify({ at, tookMs: 4000, regions: ['us-west-2'], errors: [],
     instances: [{ region: 'us-west-2', az: 'us-west-2a', id: 'i-0123456789abcdef0', type: 't4g.small', state: 'running', launchTime: at, publicIp: '192.0.2.9', tags: { Name: 'dn-testnet-masternode-1', DashNetwork: 'testnet' }, volumes: ['vol-1'], vcpus: 2, memoryMiB: 2048, lifecycle: 'on-demand' }],
@@ -155,7 +163,8 @@ try {
     await page.setViewportSize(viewport);
     await page.goto(origin + '/ci');
     await page.getByText('Runner hosts').waitFor();
-    assert.ok((await page.locator('body').innerText()).includes('mac-runner-fixture'));
+    const ciPage = await page.locator('body').innerText();
+    assert.ok(ciPage.includes('mac-runner-fixture') && ciPage.includes('light pool') && ciPage.includes('r730-light-000000'), 'runners, pools and pool jobs');
     await page.screenshot({ path: `artifacts/ci-${label}.png`, fullPage: true });
     await page.goto(origin + '/aws');
     await page.getByText('Worth a look').waitFor();
@@ -169,7 +178,7 @@ try {
   await anon.goto(origin + '/ci');
   await anon.getByText('Public view').waitFor();
   const ciText = await anon.locator('body').innerText();
-  assert.ok(ciText.includes('macOS host 1') && !ciText.includes('mac-runner-fixture') && !ciText.includes('fixture.lan'), 'public CI anonymised');
+  assert.ok(ciText.includes('macOS host 1') && ciText.includes('Linux host 1 · light pool') && !ciText.includes('mac-runner-fixture') && !ciText.includes('fixture.lan') && !/r730|proxmox3/.test(ciText), 'public CI anonymised');
   await anon.screenshot({ path: 'artifacts/ci-public.png', fullPage: true });
   await anon.goto(origin + '/aws');
   await anon.getByText('Running instances by network').waitFor();

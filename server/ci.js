@@ -1,6 +1,8 @@
 // Self-hosted CI runners. A reporter on each runner host (ci/reporter) pushes
 // host health, runner state and finished jobs every minute; GitHub's API adds
 // queue times for public repositories and lists jobs waiting for our runners.
+// Hosts running dash-ci-pool also report pools of single-use runners: a new
+// runner (and name) per job, so a pool is shown as one row with its capacity.
 //
 //   data/ci/reporters.json      reporter id -> { label, hash (sha256 of token) }
 //   data/ci/hosts/<id>.json     latest report of that host (+ hours it reported)
@@ -36,12 +38,12 @@ function cleanJob(j, hostId) {
   return {
     host: hostId, runner: str(j.runner, 300), runnerName: str(j.runnerName, 100), name, start, end: ts(j.end),
     result: str(j.result, 20), repo: repoOf(j.repo), runId: int(j.runId), attempt: int(j.attempt) || 1,
-    workflow: str(j.workflow), event: str(j.event, 40), headRef: str(j.headRef), ref: str(j.ref), visibility: str(j.visibility, 20),
+    workflow: str(j.workflow), event: str(j.event, 40), headRef: str(j.headRef), ref: str(j.ref), visibility: str(j.visibility, 20), pool: str(j.pool, 40),
   };
 }
 
 function cleanReport(b) {
-  if (b?.v !== 1 || typeof b.host !== 'object' || !Array.isArray(b.runners) || b.runners.length > 16 || (b.jobs && (!Array.isArray(b.jobs) || b.jobs.length > 500))) throw new Error('not a dash-ci-reporter v1 report');
+  if (b?.v !== 1 || typeof b.host !== 'object' || !Array.isArray(b.runners) || b.runners.length > 16 || (b.jobs && (!Array.isArray(b.jobs) || b.jobs.length > 500)) || (b.pools && (!Array.isArray(b.pools) || b.pools.length > 8))) throw new Error('not a dash-ci-reporter v1 report');
   const h = b.host;
   const usage = (u) => (u && typeof u === 'object' ? { count: int(u.count), bytes: num(u.bytes), reclaimable: num(u.reclaimable) } : null);
   const docker = h.docker && typeof h.docker === 'object' && !h.docker.error
@@ -61,6 +63,11 @@ function cleanReport(b) {
       container: str(r?.container, 100), version: str(r?.version, 20), listening: r?.listening === true, busy: r?.busy === true, job: job(r?.job),
       diag: r?.diag ? { bytes: num(r.diag.bytes), files: int(r.diag.files) } : null, error: str(r?.error, 300),
       containerState: r?.containerState ? { status: str(r.containerState.status, 20), startedAt: str(r.containerState.startedAt, 40), restarts: int(r.containerState.restarts) } : null,
+    })),
+    pools: (b.pools || []).filter((p) => typeof p?.name === 'string' && p.name).map((p) => ({
+      name: str(p.name, 40), controller: str(p.controller, 40), backend: str(p.backend, 20), labels: Array.isArray(p.labels) ? p.labels.slice(0, 10).map((l) => str(l, 60)).filter(Boolean) : [],
+      size: int(p.size) != null ? Math.min(p.size, 1000) : null, idle: int(p.idle), busy: int(p.busy), starting: int(p.starting), draining: p.draining === true, at: ts(p.at), error: str(p.error, 300),
+      instances: Array.isArray(p.instances) ? p.instances.slice(0, 64).map((i) => ({ name: str(i?.name, 100), state: ['idle', 'busy', 'starting'].includes(i?.state) ? i.state : null, since: ts(i?.since) })).filter((i) => i.name && i.state) : [],
     })),
     jobs: b.jobs || [],
   };
@@ -156,11 +163,18 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
     return out;
   }
 
-  const ourRunners = () => new Set(list(dirs.hosts).flatMap((h) => (h.runners || []).map((r) => r.name)));
+  // Pool runners exist for one job, often for seconds: dash-ci-pool names them
+  // <controller>-<pool>-<6 hex>, so they are recognised before their job is reported.
+  function ourRunners() {
+    const hosts = list(dirs.hosts);
+    const names = new Set(hosts.flatMap((h) => (h.runners || []).map((r) => r.name)));
+    const prefixes = hosts.flatMap((h) => (h.pools || []).filter((p) => p.controller).map((p) => `${p.controller}-${p.name}-`));
+    return (name) => typeof name === 'string' && (names.has(name) || prefixes.some((p) => name.startsWith(p) && /^[0-9a-f]{6}$/.test(name.slice(p.length))));
+  }
   async function enrich(jobs) {
     const now = clock();
     const due = new Map();
-    const ours = ourRunners();
+    const isOurs = ourRunners();
     for (const j of jobs) {
       if (!j.repo || !j.runId || j.visibility === 'private' || j.visibility === 'internal' || Date.parse(j.start) < now - 3 * DAY) continue;
       const k = runKey(j), e = gh.runs[k];
@@ -174,7 +188,7 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
       try {
         const all = await runJobs(j.repo, j.runId, j.attempt || 1);
         // Only jobs our runners ran are kept: timing and served label sets.
-        gh.runs[k] = all ? { fetchedAt: now, attempts: e.attempts + 1, complete: all.every((x) => x.status === 'completed'), jobs: all.filter((x) => ours.has(x.runner)) } : { fetchedAt: now, attempts: e.attempts + 1, missing: true };
+        gh.runs[k] = all ? { fetchedAt: now, attempts: e.attempts + 1, complete: all.every((x) => x.status === 'completed'), jobs: all.filter((x) => isOurs(x.runner)) } : { fetchedAt: now, attempts: e.attempts + 1, missing: true };
       } catch (err) {
         gh.runs[k] = { ...e, fetchedAt: now, attempts: e.attempts + 1, error: err.message };
         if (/rate limit/.test(err.message)) break;
@@ -187,8 +201,8 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
   // Label sets our runners have served: a queued job wanting one is ours.
   function servedLabels() {
     const sets = new Set();
-    const names = ourRunners();
-    for (const e of Object.values(gh.runs)) for (const j of e.jobs || []) if (names.has(j.runner) && j.labels?.length) sets.add(JSON.stringify([...j.labels].sort()));
+    const isOurs = ourRunners();
+    for (const e of Object.values(gh.runs)) for (const j of e.jobs || []) if (isOurs(j.runner) && j.labels?.length) sets.add(JSON.stringify([...j.labels].sort()));
     return sets;
   }
   async function pollQueue(jobs) {
@@ -250,31 +264,58 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
     const regs = reporters();
     const jobs = allJobs().map((j) => ({ ...j, ...timing(j) }));
     const dur = (j) => (j.end ? (Date.parse(j.end) - Date.parse(j.start)) / 1000 : null);
-    const runners = [];
+    const dayStats = (mine, busyIn) => {
+      const day = mine.filter((j) => Date.parse(j.start) > now - DAY);
+      return { jobs: day.length, succeeded: day.filter((j) => j.result === 'Succeeded').length, failed: day.filter((j) => j.result === 'Failed').length, canceled: day.filter((j) => j.result === 'Canceled' || j.result === 'Abandoned').length, busySec: Math.round(busyIn(now - DAY, now) / 1000) };
+    };
+    // Busy share of `slots` runners for each of the last 48 hours.
+    const hourStrip = (h, busyIn, slots) => {
+      const hours = [];
+      for (let i = 47; i >= 0; i--) {
+        const end = Math.floor(now / 3_600_000) * 3_600_000 + 3_600_000 - i * 3_600_000, start = end - 3_600_000;
+        const label = new Date(start).toISOString().slice(0, 13);
+        hours.push({ hour: `${label}:00Z`, busy: slots ? Math.min(1, busyIn(start, Math.min(end, now)) / (slots * Math.max(1, Math.min(end, now) - start))) : 0, reported: !!h.seen?.[label] });
+      }
+      return hours;
+    };
+    const runners = [], pools = [];
     for (const h of hosts) {
       const stale = now - Date.parse(h.receivedAt) > STALE_MS;
+      const hostLabel = regs[h.id]?.label || h.id;
       for (const r of h.runners || []) {
         const mine = jobs.filter((j) => j.host === h.id && (j.runnerName ? j.runnerName === r.name : j.runner === r.key));
         const busyIn = (a, b) => mine.reduce((s, j) => s + (j.end ? overlap(Date.parse(j.start), Date.parse(j.end), a, b) : 0), 0)
           + (r.busy && r.job?.start && !stale ? overlap(Date.parse(r.job.start), now, a, b) : 0);
-        const day = mine.filter((j) => Date.parse(j.start) > now - DAY);
-        const hours = [];
-        for (let i = 47; i >= 0; i--) {
-          const end = Math.floor(now / 3_600_000) * 3_600_000 + 3_600_000 - i * 3_600_000, start = end - 3_600_000;
-          const label = new Date(start).toISOString().slice(0, 13);
-          hours.push({ hour: `${label}:00Z`, busy: Math.min(1, busyIn(start, Math.min(end, now)) / Math.max(1, Math.min(end, now) - start)), reported: !!h.seen?.[label] });
-        }
         const status = stale ? 'offline' : r.error ? 'error' : !r.listening ? 'offline' : r.busy ? 'busy' : 'idle';
         runners.push({
-          host: h.id, hostLabel: regs[h.id]?.label || h.id, hostname: h.host?.hostname, receivedAt: h.receivedAt, stale, status,
+          host: h.id, hostLabel, hostname: h.host?.hostname, receivedAt: h.receivedAt, stale, status,
           name: r.name || r.key, pool: r.pool, kind: r.kind, container: r.container, version: r.version, error: r.error, containerState: r.containerState,
           job: r.busy && !stale ? r.job : null, diag: r.diag,
-          day: { jobs: day.length, succeeded: day.filter((j) => j.result === 'Succeeded').length, failed: day.filter((j) => j.result === 'Failed').length, canceled: day.filter((j) => j.result === 'Canceled' || j.result === 'Abandoned').length, busySec: Math.round(busyIn(now - DAY, now) / 1000) },
-          hours,
+          day: dayStats(mine, busyIn),
+          hours: hourStrip(h, busyIn, 1),
+        });
+      }
+      for (const p of h.pools || []) {
+        // One reporter may read several controllers: a job belongs to the one its runner name says.
+        const mine = jobs.filter((j) => j.host === h.id && j.pool === p.name && (!p.controller || String(j.runnerName).startsWith(`${p.controller}-${p.name}-`)));
+        // Jobs shorter than a report interval only show up in the ledger, so busy time comes from it.
+        const busyIn = (a, b) => mine.reduce((s, j) => s + (j.end ? overlap(Date.parse(j.start), Date.parse(j.end), a, b) : 0), 0);
+        const size = p.size || 0, count = (k) => (stale ? 0 : p[k] || 0);
+        const idle = count('idle'), busy = count('busy'), starting = count('starting'), online = idle + busy;
+        // A new runner starts as each one finishes its job: only a shortfall beyond those is a problem.
+        const status = stale ? 'offline' : p.error ? 'error' : p.draining ? 'draining' : size && !online && !starting ? 'offline' : online + starting < size ? 'short' : 'ok';
+        pools.push({
+          host: h.id, hostLabel, receivedAt: h.receivedAt, stale, status, name: p.name, controller: p.controller, backend: p.backend, labels: p.labels,
+          // A drained pool is emptied on purpose; one that shrank still counts the runners it has.
+          size, capacity: p.draining ? online + starting : Math.max(size, online + starting), online, idle, busy, starting, draining: p.draining, error: p.error,
+          running: stale ? [] : p.instances.filter((i) => i.state === 'busy').map((i) => ({ name: i.name, since: i.since })),
+          day: dayStats(mine, busyIn),
+          hours: hourStrip(h, busyIn, size),
         });
       }
     }
     runners.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    pools.sort((a, b) => `${a.hostLabel}|${a.name}`.localeCompare(`${b.hostLabel}|${b.name}`));
     const day = jobs.filter((j) => Date.parse(j.start) > now - DAY);
     const week = jobs.filter((j) => Date.parse(j.start) > now - 7 * DAY);
     const queued = gh.queue?.jobs || [];
@@ -298,16 +339,20 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
     }
     const dq = day.map((j) => j.queueSec).filter((x) => x != null);
     const online = runners.filter((r) => r.status === 'busy' || r.status === 'idle');
+    const sum = (k) => pools.reduce((a, p) => a + p[k], 0);
+    const capacity = runners.length + sum('capacity');
+    const busySec = [...runners, ...pools].reduce((a, x) => a + x.day.busySec, 0);
     return {
       at: new Date(now).toISOString(),
       totals: {
-        runners: runners.length, online: online.length, busy: runners.filter((r) => r.status === 'busy').length,
+        runners: capacity, online: online.length + sum('online'), starting: sum('starting'), busy: runners.filter((r) => r.status === 'busy').length + sum('busy'),
         jobs24h: day.length, succeeded24h: day.filter((j) => j.result === 'Succeeded').length, failed24h: day.filter((j) => j.result === 'Failed').length,
-        utilization24h: runners.length ? runners.reduce((a, r) => a + r.day.busySec, 0) / (runners.length * 86_400) : null,
+        utilization24h: capacity ? busySec / (capacity * 86_400) : null,
         medianQueueSec24h: median(dq), p90QueueSec24h: pctile(dq, 0.9), queuedNow: queued.length, oldestQueuedAt: queued[0]?.createdAt || null,
       },
       hosts: hosts.map((h) => ({ id: h.id, label: regs[h.id]?.label || h.id, receivedAt: h.receivedAt, measuredAt: h.at, stale: now - Date.parse(h.receivedAt) > STALE_MS, reporter: h.reporter, python: h.python, ...h.host })).sort((a, b) => a.label.localeCompare(b.label)),
       runners,
+      pools,
       queue: gh.queue ? { ...gh.queue, jobs: queued.slice(0, 50) } : null,
       workflows: workflows.slice(0, 40),
       daily,
@@ -344,10 +389,12 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
       runners: s.runners.map((r) => ({ host: hostLabel.get(r.host), hostLabel: hostLabel.get(r.host), name: runnerOf(r.name), status: r.status, stale: r.stale, receivedAt: r.receivedAt,
         kind: r.kind, version: r.version, day: r.day, hours: r.hours,
         job: r.job && { name: masked(r.job.repo, r.job.name), repo: repo(r.job.repo), workflow: masked(r.job.repo, r.job.workflow), start: r.job.start } })),
+      pools: s.pools.map((p) => ({ host: hostLabel.get(p.host), hostLabel: hostLabel.get(p.host), name: p.name, status: p.status, stale: p.stale, receivedAt: p.receivedAt, backend: p.backend, labels: p.labels,
+        size: p.size, capacity: p.capacity, online: p.online, idle: p.idle, busy: p.busy, starting: p.starting, draining: p.draining, running: p.running.map((i) => ({ since: i.since })), day: p.day, hours: p.hours })),
       queue: s.queue && { at: s.queue.at, jobs: s.queue.jobs.filter((j) => !privateRepos.has(j.repo)).map((j) => ({ id: j.id, repo: j.repo, workflow: j.workflow, name: j.name, labels: j.labels, createdAt: j.createdAt })) },
       workflows: s.workflows.map((w) => ({ ...w, repo: repo(w.repo), workflow: masked(w.repo, w.workflow) })),
       daily: s.daily,
-      recent: s.recent.map((j) => ({ runnerName: runnerOf(j.runnerName), start: j.start, end: j.end, name: masked(j.repo, j.name), repo: repo(j.repo), workflow: masked(j.repo, j.workflow),
+      recent: s.recent.map((j) => ({ runnerName: j.pool ? `${hostLabel.get(j.host) || 'host'} · ${j.pool} pool` : runnerOf(j.runnerName), pool: j.pool, start: j.start, end: j.end, name: masked(j.repo, j.name), repo: repo(j.repo), workflow: masked(j.repo, j.workflow),
         result: j.result, durationSec: j.durationSec, queueSec: j.queueSec ?? null })),
       github: { enabled: s.github.enabled },
     };

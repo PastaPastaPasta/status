@@ -107,3 +107,62 @@ test('before sign-in: statistics without names, hosts, branches, links or privat
   assert.equal(p.totals.jobs24h, 2);
   assert.equal(p.reporters, undefined);
 });
+
+test('dash-ci-pool hosts: pools count as capacity, single-use runner jobs are timed and anonymised', async () => {
+  const pool = { name: 'light', controller: 'r730', backend: 'proxmox-lxc', labels: ['self-hosted', 'Linux', 'X64', 'dash-x64-light'], size: 4, idle: 2, busy: 1, starting: 1, draining: false, at: iso(T0),
+    instances: [{ name: 'r730-light-aaaaaa', state: 'busy', since: iso(T0 - 60_000) }, { name: 'r730-light-bbbbbb', state: 'idle', since: iso(T0 - 600_000) }, { name: 'x', state: 'weird' }] };
+  const poolJob = (startMin, runner, extra = {}) => job(startMin, 0.5, { runner, runnerName: runner, pool: 'light', repo: 'dashpay/dash', runId: 500 + startMin, workflow: 'CI', name: 'Lint', ...extra });
+  const fetcher = async (url) => {
+    const headers = { 'x-ratelimit-remaining': '4999', 'x-ratelimit-reset': String(T0 / 1000 + 3600) };
+    const ghJob = (id, runner, offset) => ({ id, name: 'Lint', status: 'completed', conclusion: 'success', created_at: iso(T0 - 30 * 60_000 - 4000), started_at: iso(T0 - 30 * 60_000 + offset), completed_at: iso(T0 - 29 * 60_000), runner_name: runner, labels: ['dash-x64-light'], html_url: `https://github.com/dashpay/dash/actions/runs/530/job/${id}` });
+    if (url.includes('/runs/530/attempts/1/jobs')) return Response.json({ jobs: [ghJob(9, 'r730-light-cccccc', 1000), ghJob(10, 'r730-light-eeeeee', 2000), ghJob(11, 'GitHub Actions 7', 0)] }, { headers });
+    if (url.includes('status=')) return Response.json({ workflow_runs: [] }, { headers });
+    return new Response('{}', { status: 404, headers });
+  };
+  const ci = createCi({ dataDir: mkdtempSync(join(tmpdir(), 'ci-')), clock: () => T0, fetcher, github: { id: 'cid', secret: 'sec' } });
+  const { id } = ci.addReporter('r730');
+  assert.throws(() => ci.ingest(id, { ...report(), pools: Array(9).fill(pool) }), /v1 report/);
+  ci.ingest(id, { ...report([poolJob(30, 'r730-light-cccccc'), poolJob(90, 'r730-light-dddddd', { result: 'Failed' })]), runners: [], pools: [pool] });
+  await ci.tick();
+  const s = ci.summary();
+  assert.equal(s.runners.length, 0);
+  const p = s.pools[0];
+  assert.deepEqual([p.status, p.size, p.online, p.busy, p.idle, p.starting], ['ok', 4, 3, 1, 2, 1]);
+  assert.deepEqual(p.running, [{ name: 'r730-light-aaaaaa', since: iso(T0 - 60_000) }]);
+  ci.ingest(id, { ...report(), runners: [], pools: [{ ...pool, idle: 1, starting: 0 }] });
+  assert.equal(ci.summary().pools[0].status, 'short');
+  // Draining empties the pool on purpose: what is left is the capacity, not its size.
+  ci.ingest(id, { ...report(), runners: [], pools: [{ ...pool, idle: 0, starting: 0, draining: true }] });
+  const drained = ci.summary();
+  assert.deepEqual([drained.pools[0].status, drained.totals.runners, drained.totals.online], ['draining', 1, 1]);
+  ci.ingest(id, { ...report(), runners: [], pools: [pool] });
+  assert.deepEqual([p.day.jobs, p.day.failed, p.day.busySec], [2, 1, 60]);
+  // A second controller's light pool on the same reporter keeps its own jobs.
+  ci.ingest(id, { ...report(), runners: [], pools: [pool, { ...pool, controller: 'other' }] });
+  assert.deepEqual(ci.summary().pools.map((x) => x.day.jobs), [2, 0]);
+  ci.ingest(id, { ...report(), runners: [], pools: [pool] });
+  assert.equal(p.hours.length, 48);
+  assert.deepEqual([s.totals.runners, s.totals.online, s.totals.busy, s.totals.jobs24h], [4, 3, 1, 2]);
+  // The runner is gone, but its job is matched on GitHub by the name it ran under.
+  const timed = s.recent.find((j) => j.runnerName === 'r730-light-cccccc');
+  assert.equal(timed.queueSec, 5);
+  assert.equal(timed.url, 'https://github.com/dashpay/dash/actions/runs/530/job/9');
+  // Its run was complete when fetched; a job of the same run reported a minute later is still timed.
+  ci.ingest(id, { ...report([poolJob(30, 'r730-light-eeeeee', { start: iso(T0 - 30 * 60_000 + 2000) })]), runners: [], pools: [pool] });
+  assert.equal(ci.summary().recent.find((j) => j.runnerName === 'r730-light-eeeeee').queueSec, 6);
+
+  const pub = ci.publicSummary();
+  const text = JSON.stringify(pub);
+  for (const leak of ['r730', 'cccccc']) assert.ok(!text.includes(leak), `leaked ${leak}`);
+  assert.equal(pub.pools[0].hostLabel, 'macOS host 1');
+  assert.deepEqual(pub.pools[0].running, [{ since: iso(T0 - 60_000) }]);
+  assert.equal(pub.recent[0].runnerName, 'macOS host 1 · light pool');
+
+  // No report for four minutes: the pool is offline and none of it counts as online.
+  let later = T0;
+  const stale = createCi({ dataDir: mkdtempSync(join(tmpdir(), 'ci-')), clock: () => later });
+  stale.ingest(stale.addReporter('r730').id, { ...report(), runners: [], pools: [pool] });
+  later += 4 * 60_000;
+  const off = stale.summary();
+  assert.deepEqual([off.pools[0].status, off.pools[0].online, off.pools[0].running.length, off.totals.online], ['offline', 0, 0, 0]);
+});
