@@ -114,7 +114,8 @@ test('dash-ci-pool hosts: pools count as capacity, single-use runner jobs are ti
   const poolJob = (startMin, runner, extra = {}) => job(startMin, 0.5, { runner, runnerName: runner, pool: 'light', repo: 'dashpay/dash', runId: 500 + startMin, workflow: 'CI', name: 'Lint', ...extra });
   const fetcher = async (url) => {
     const headers = { 'x-ratelimit-remaining': '4999', 'x-ratelimit-reset': String(T0 / 1000 + 3600) };
-    if (url.includes('/runs/530/attempts/1/jobs')) return Response.json({ jobs: [{ id: 9, name: 'Lint', status: 'completed', conclusion: 'success', created_at: iso(T0 - 30 * 60_000 - 4000), started_at: iso(T0 - 30 * 60_000 + 1000), completed_at: iso(T0 - 29 * 60_000), runner_name: 'r730-light-cccccc', labels: ['dash-x64-light'], html_url: 'https://github.com/dashpay/dash/actions/runs/530/job/9' }] }, { headers });
+    const ghJob = (id, runner, offset) => ({ id, name: 'Lint', status: 'completed', conclusion: 'success', created_at: iso(T0 - 30 * 60_000 - 4000), started_at: iso(T0 - 30 * 60_000 + offset), completed_at: iso(T0 - 29 * 60_000), runner_name: runner, labels: ['dash-x64-light'], html_url: `https://github.com/dashpay/dash/actions/runs/530/job/${id}` });
+    if (url.includes('/runs/530/attempts/1/jobs')) return Response.json({ jobs: [ghJob(9, 'r730-light-cccccc', 1000), ghJob(10, 'r730-light-eeeeee', 2000), ghJob(11, 'GitHub Actions 7', 0)] }, { headers });
     if (url.includes('status=')) return Response.json({ workflow_runs: [] }, { headers });
     return new Response('{}', { status: 404, headers });
   };
@@ -130,6 +131,9 @@ test('dash-ci-pool hosts: pools count as capacity, single-use runner jobs are ti
   assert.deepEqual(p.running, [{ name: 'r730-light-aaaaaa', since: iso(T0 - 60_000) }]);
   ci.ingest(id, { ...report(), runners: [], pools: [{ ...pool, idle: 1, starting: 0 }] });
   assert.equal(ci.summary().pools[0].status, 'short');
+  // Draining empties the pool on purpose: what is left is the capacity, not its size.
+  ci.ingest(id, { ...report(), runners: [], pools: [{ ...pool, idle: 0, starting: 0, draining: true }] });
+  assert.deepEqual([ci.summary().pools[0].status, ci.summary().totals.runners, ci.summary().totals.online], ['draining', 1, 1]);
   ci.ingest(id, { ...report(), runners: [], pools: [pool] });
   assert.deepEqual([p.day.jobs, p.day.failed, p.day.busySec], [2, 1, 60]);
   assert.equal(p.hours.length, 48);
@@ -138,6 +142,9 @@ test('dash-ci-pool hosts: pools count as capacity, single-use runner jobs are ti
   const timed = s.recent.find((j) => j.runnerName === 'r730-light-cccccc');
   assert.equal(timed.queueSec, 5);
   assert.equal(timed.url, 'https://github.com/dashpay/dash/actions/runs/530/job/9');
+  // Its run was complete when fetched; a job of the same run reported a minute later is still timed.
+  ci.ingest(id, { ...report([poolJob(30, 'r730-light-eeeeee', { start: iso(T0 - 30 * 60_000 + 2000) })]), runners: [], pools: [pool] });
+  assert.equal(ci.summary().recent.find((j) => j.runnerName === 'r730-light-eeeeee').queueSec, 6);
 
   const pub = ci.publicSummary();
   const text = JSON.stringify(pub);

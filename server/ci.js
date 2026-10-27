@@ -66,7 +66,7 @@ function cleanReport(b) {
     })),
     pools: (b.pools || []).filter((p) => typeof p?.name === 'string' && p.name).map((p) => ({
       name: str(p.name, 40), controller: str(p.controller, 40), backend: str(p.backend, 20), labels: Array.isArray(p.labels) ? p.labels.slice(0, 10).map((l) => str(l, 60)).filter(Boolean) : [],
-      size: int(p.size), idle: int(p.idle), busy: int(p.busy), starting: int(p.starting), draining: p.draining === true, at: ts(p.at), error: str(p.error, 300),
+      size: int(p.size) != null ? Math.min(p.size, 1000) : null, idle: int(p.idle), busy: int(p.busy), starting: int(p.starting), draining: p.draining === true, at: ts(p.at), error: str(p.error, 300),
       instances: Array.isArray(p.instances) ? p.instances.slice(0, 64).map((i) => ({ name: str(i?.name, 100), state: ['idle', 'busy', 'starting'].includes(i?.state) ? i.state : null, since: ts(i?.since) })).filter((i) => i.name && i.state) : [],
     })),
     jobs: b.jobs || [],
@@ -163,9 +163,14 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
     return out;
   }
 
-  // Pool runners exist for one job: their names come from the jobs they ran.
-  const ourRunners = () => new Set([...list(dirs.hosts).flatMap((h) => [...(h.runners || []).map((r) => r.name), ...(h.pools || []).flatMap((p) => p.instances.map((i) => i.name))]),
-    ...allJobs().filter((j) => j.pool).map((j) => j.runnerName)]);
+  // Pool runners exist for one job, often for seconds: dash-ci-pool names them
+  // <controller>-<pool>-<6 hex>, so they are recognised before their job is reported.
+  function ourRunners() {
+    const hosts = list(dirs.hosts);
+    const names = new Set(hosts.flatMap((h) => (h.runners || []).map((r) => r.name)));
+    const prefixes = hosts.flatMap((h) => (h.pools || []).filter((p) => p.controller).map((p) => `${p.controller}-${p.name}-`));
+    return { has: (name) => typeof name === 'string' && (names.has(name) || prefixes.some((p) => name.startsWith(p) && /^[0-9a-f]{6}$/.test(name.slice(p.length)))) };
+  }
   async function enrich(jobs) {
     const now = clock();
     const due = new Map();
@@ -299,12 +304,14 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
           const label = new Date(start).toISOString().slice(0, 13);
           hours.push({ hour: `${label}:00Z`, busy: size ? Math.min(1, busyIn(start, Math.min(end, now)) / (size * Math.max(1, Math.min(end, now) - start))) : 0, reported: !!h.seen?.[label] });
         }
-        const online = stale ? 0 : (p.idle || 0) + (p.busy || 0);
+        const online = stale ? 0 : (p.idle || 0) + (p.busy || 0), starting = stale ? 0 : p.starting || 0;
         // A new runner starts as each one finishes its job: only a shortfall beyond those is a problem.
-        const status = stale ? 'offline' : p.error ? 'error' : p.draining ? 'draining' : size && !online ? 'offline' : online + (p.starting || 0) < size ? 'short' : 'ok';
+        const status = stale ? 'offline' : p.error ? 'error' : p.draining ? 'draining' : size && !online && !starting ? 'offline' : online + starting < size ? 'short' : 'ok';
+        // A drained pool is emptied on purpose; one that shrank still counts the runners it has.
+        const capacity = p.draining ? online + starting : Math.max(size, online + starting);
         pools.push({
           host: h.id, hostLabel: regs[h.id]?.label || h.id, receivedAt: h.receivedAt, stale, status, name: p.name, controller: p.controller, backend: p.backend, labels: p.labels,
-          size, online, idle: stale ? 0 : p.idle || 0, busy: stale ? 0 : p.busy || 0, starting: stale ? 0 : p.starting || 0, draining: p.draining, error: p.error,
+          size, capacity, online, idle: stale ? 0 : p.idle || 0, busy: stale ? 0 : p.busy || 0, starting, draining: p.draining, error: p.error,
           running: busy.map((i) => ({ name: i.name, since: i.since })),
           day: { jobs: day.length, succeeded: day.filter((j) => j.result === 'Succeeded').length, failed: day.filter((j) => j.result === 'Failed').length, canceled: day.filter((j) => j.result === 'Canceled' || j.result === 'Abandoned').length, busySec: Math.round(busyIn(now - DAY, now) / 1000) },
           hours,
@@ -336,7 +343,7 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
     const dq = day.map((j) => j.queueSec).filter((x) => x != null);
     const online = runners.filter((r) => r.status === 'busy' || r.status === 'idle');
     const sum = (k) => pools.reduce((a, p) => a + (p[k] || 0), 0);
-    const capacity = runners.length + sum('size');
+    const capacity = runners.length + sum('capacity');
     return {
       at: new Date(now).toISOString(),
       totals: {
@@ -375,9 +382,7 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
       const mine = s.runners.filter((r) => r.host === id);
       mine.forEach((r, i) => runnerLabel.set(r.name, mine.length > 1 ? `${label} · runner ${i + 1}` : `${label} runner`));
     }
-    const poolLabel = (host, pool) => `${hostLabel.get(host) || 'host'} · ${pool} pool`;
-    const poolOf = new Map(allJobs().filter((j) => j.pool).map((j) => [j.runnerName, poolLabel(j.host, j.pool)]));
-    const runnerOf = (name) => runnerLabel.get(name) || poolOf.get(name) || 'runner';
+    const runnerOf = (name) => runnerLabel.get(name) || 'runner';
     const usage = (d) => (d && !d.error ? Object.fromEntries(['images', 'containers', 'volumes', 'buildCache'].map((k) => [k, d[k] ? { bytes: d[k].bytes, reclaimable: d[k].reclaimable } : null])) : null);
     return {
       public: true, at: s.at, totals: s.totals,
@@ -387,11 +392,11 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
         kind: r.kind, version: r.version, day: r.day, hours: r.hours,
         job: r.job && { name: masked(r.job.repo, r.job.name), repo: repo(r.job.repo), workflow: masked(r.job.repo, r.job.workflow), start: r.job.start } })),
       pools: s.pools.map((p) => ({ host: hostLabel.get(p.host), hostLabel: hostLabel.get(p.host), name: p.name, status: p.status, stale: p.stale, receivedAt: p.receivedAt, backend: p.backend, labels: p.labels,
-        size: p.size, online: p.online, idle: p.idle, busy: p.busy, starting: p.starting, draining: p.draining, running: p.running.map((i) => ({ since: i.since })), day: p.day, hours: p.hours })),
+        size: p.size, capacity: p.capacity, online: p.online, idle: p.idle, busy: p.busy, starting: p.starting, draining: p.draining, running: p.running.map((i) => ({ since: i.since })), day: p.day, hours: p.hours })),
       queue: s.queue && { at: s.queue.at, jobs: s.queue.jobs.filter((j) => !privateRepos.has(j.repo)).map((j) => ({ id: j.id, repo: j.repo, workflow: j.workflow, name: j.name, labels: j.labels, createdAt: j.createdAt })) },
       workflows: s.workflows.map((w) => ({ ...w, repo: repo(w.repo), workflow: masked(w.repo, w.workflow) })),
       daily: s.daily,
-      recent: s.recent.map((j) => ({ runnerName: runnerOf(j.runnerName), pool: j.pool, start: j.start, end: j.end, name: masked(j.repo, j.name), repo: repo(j.repo), workflow: masked(j.repo, j.workflow),
+      recent: s.recent.map((j) => ({ runnerName: j.pool ? `${hostLabel.get(j.host) || 'host'} · ${j.pool} pool` : runnerOf(j.runnerName), pool: j.pool, start: j.start, end: j.end, name: masked(j.repo, j.name), repo: repo(j.repo), workflow: masked(j.repo, j.workflow),
         result: j.result, durationSec: j.durationSec, queueSec: j.queueSec ?? null })),
       github: { enabled: s.github.enabled },
     };

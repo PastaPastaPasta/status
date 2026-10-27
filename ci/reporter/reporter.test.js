@@ -142,6 +142,8 @@ test('reporter sends dash-ci-pool pools and each single-use runner job once', { 
     p = await run();
     assert.equal(p.status, 0, p.stderr);
     assert.deepEqual(bodies.at(-1).jobs.map((j) => j.runnerName), ['r730-light-eeeeee']);
-    assert.match(bodies.at(-1).pools[0].error, /has not updated its status for 10 min/);
+    const stale = bodies.at(-1).pools[0];
+    assert.match(stale.error, /has not updated its status for 10 min/);
+    assert.deepEqual([stale.busy, stale.idle, stale.instances], [0, 0, []]);
   } finally { server.close(); }
 });

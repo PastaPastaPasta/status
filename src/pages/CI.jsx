@@ -86,8 +86,8 @@ export default function CI() {
           <table className="grid w-full text-[12px]">
             <thead><tr><th>Finished</th><th>Runner</th><th>Repository</th><th>Workflow / job</th>{!data.public && <th>Branch</th>}<th className="text-right">Queued</th><th className="text-right">Ran</th><th>Result</th></tr></thead>
             <tbody>
-              {data.recent.map((j) => (
-                <tr key={`${j.runnerName}|${j.start}|${j.name}`}>
+              {data.recent.map((j, i) => (
+                <tr key={`${j.runnerName}|${j.start}|${j.name}|${i}`}>
                   <td className="mono text-dim" title={clock(j.end)}>{ago(j.end, now)} ago</td>
                   <td className="mono">{j.runnerName}</td>
                   <td className="mono text-dim">{j.repo || '—'}</td>
@@ -131,7 +131,7 @@ function HostCard({ h, now, bind }) {
         <Metric k="Docker"><div className="mono text-right">{docker != null ? bytes(docker) : '—'}</div><div className="text-faint mono text-[10.5px] text-right">{reclaim ? `${bytes(reclaim)} reclaimable` : h.docker?.error ? 'unavailable' : ''}</div></Metric>
       </div>
       {h.runners.map((r) => <RunnerRow key={r.name} r={r} now={now} bind={bind} />)}
-      {h.pools.map((p) => <PoolRow key={p.name} p={p} now={now} bind={bind} />)}
+      {h.pools.map((p, i) => <PoolRow key={`${p.name}|${i}`} p={p} now={now} bind={bind} />)}
       <div className="px-3 py-1.5 border-t border-line text-faint text-[10.5px] mono">up {secs(h.uptimeSec)}{h.reporter ? ` · reporter v${h.reporter} · python ${h.python}` : ''}</div>
     </div>
   );
@@ -179,10 +179,10 @@ function PoolRow({ p, now, bind }) {
         <span className={`lv-${level}`}>{label}</span>
         {(p.labels || []).filter((l) => !DEFAULT_LABELS.has(l) && l !== 'dash-ci-pool').map((l) => <span key={l} className="tag">{l}</span>)}
         <span className="text-dim mono text-[11px]">single-use{p.backend ? ` · ${p.backend}` : ''}</span>
-        <span className="ml-auto text-dim text-[11px]">24h: <span className="mono text-fg">{p.day.jobs}</span> jobs{p.day.failed ? <> · <span className="mono lv-down">{p.day.failed}</span> failed</> : null} · busy <span className="mono text-fg">{pct(p.size ? (p.day.busySec / (p.size * 86400)) * 100 : 0)}</span></span>
+        <span className="ml-auto text-dim text-[11px]">24h: <span className="mono text-fg">{p.day.jobs}</span> jobs{p.day.failed ? <> · <span className="mono lv-down">{p.day.failed}</span> failed</> : null} · busy <span className="mono text-fg">{pct(p.size ? Math.min(100, (p.day.busySec / (p.size * 86400)) * 100) : 0)}</span></span>
       </div>
       <div className="mt-1 text-[12px] text-dim">
-        <span className="mono text-fg">{p.online}</span>/{p.size} ready · <span className="mono text-fg">{p.busy}</span> running a job · <span className="mono text-fg">{p.idle}</span> waiting{p.starting ? <> · <span className="mono text-fg">{p.starting}</span> starting</> : null}
+        <span className="mono text-fg">{p.online}</span>/{p.size} online: <span className="mono text-fg">{p.busy}</span> running a job · <span className="mono text-fg">{p.idle}</span> waiting{p.starting ? <> · <span className="mono text-fg">{p.starting}</span> starting</> : null}
         {p.running?.length > 0 && <span className="mono"> · oldest job {ago(p.running.reduce((a, i) => (!a || i.since < a ? i.since : a), null), now)}</span>}
       </div>
       {p.error && <div className="mt-1 text-[11.5px] lv-warn mono truncate" title={p.error}>{p.error}</div>}

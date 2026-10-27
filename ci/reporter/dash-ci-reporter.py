@@ -311,17 +311,21 @@ def add_meta(r, job, workers):
 
 def collect_pool(directory, state, pending, now):
     """Pools of a dash-ci-pool controller; its newly finished jobs go to `pending`."""
-    with open(os.path.join(directory, 'status.json')) as f:
-        status = json.load(f)
-    age = now - status['time']
-    instances = status.get('instances', [])
-    pools = []
-    for name, p in sorted(status.get('pools', {}).items()):
-        pools.append(dict(controller=status.get('host'), name=name, backend=p.get('backend'), labels=p.get('labels', []),
-                          size=p.get('size'), idle=p.get('idle'), busy=p.get('busy'), starting=p.get('starting'),
-                          draining=status.get('draining') is True, at=iso(status['time']),
-                          error='dash-ci-pool has not updated its status for %d min' % (age // 60) if age > POOL_STALE else None,
-                          instances=[dict(name=i['name'], state=i['state'], since=iso(i['since'])) for i in instances if i.get('pool') == name][:64]))
+    pools, error = [], None
+    try:
+        with open(os.path.join(directory, 'status.json')) as f:
+            status = json.load(f)
+        age = now - status['time']
+        stale = age > POOL_STALE  # a stopped controller leaves its last status behind
+        instances = [] if stale else status.get('instances', [])
+        for name, p in sorted(status.get('pools', {}).items()):
+            pools.append(dict(controller=status.get('host'), name=name, backend=p.get('backend'), labels=p.get('labels', []),
+                              size=p.get('size'), idle=0 if stale else p.get('idle'), busy=0 if stale else p.get('busy'),
+                              starting=0 if stale else p.get('starting'), draining=status.get('draining') is True, at=iso(status['time']),
+                              error='dash-ci-pool has not updated its status for %d min' % (age // 60) if stale else None,
+                              instances=[dict(name=i['name'], state=i['state'], since=iso(i['since'])) for i in instances if i.get('pool') == name][:64]))
+    except Exception as e:  # jobs are still delivered
+        error = ('%s: %s' % (type(e).__name__, e))[:300]
     seen = state.setdefault('poolSeen', [])
     known = set(seen)
     try:
@@ -329,19 +333,26 @@ def collect_pool(directory, state, pending, now):
             lines = f.read().splitlines()
     except FileNotFoundError:
         lines = []
+    except Exception as e:
+        lines, error = [], error or ('%s: %s' % (type(e).__name__, e))[:300]
     for line in lines:
         try:
             j = json.loads(line)
         except ValueError:
             continue
         runner = j.get('runner') if isinstance(j, dict) else None
-        if not isinstance(runner, str) or runner in known:
+        key = '%s|%s' % (runner, j.get('start')) if isinstance(runner, str) else None
+        if not key or key in known:
             continue
-        known.add(runner)
-        seen.append(runner)
+        known.add(key)
+        seen.append(key)
         job = {k: j[k] for k in JOB_KEYS if j.get(k) is not None}
         pending.append(dict(job, runner=runner, runnerName=runner, pool=j.get('pool')))
     del seen[:-POOL_SEEN]
+    if error and not pools:
+        raise RuntimeError(error)
+    for p in pools:
+        p['error'] = p['error'] or error
     return pools
 
 
