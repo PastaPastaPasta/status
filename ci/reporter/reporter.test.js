@@ -162,8 +162,8 @@ test('gate runs only the reporter commands, only on .runner and _diag', { skip: 
   for (const command of [
     'docker exec ci ls -1A /runner/_diag',
     'docker exec ci stat -c %s /runner/_diag/Runner_20261028-000000-utc.log',
-    `docker exec ci sh -c 'tail -c +1 "$1" | head -c 131072' sh /runner/_diag/Worker_20261028-000000-utc.log`,
-    `docker exec ci sh -c 'tail -c +4097 "$1"' sh /runner/.runner`,
+    `docker exec ci sh -c 'test -f "$1" && test ! -L "$1" && tail -c +1 "$1" | head -c 131072' sh /runner/_diag/Worker_20261028-000000-utc.log`,
+    `docker exec ci sh -c 'test -f "$1" && test ! -L "$1" && tail -c +4097 "$1"' sh /runner/.runner`,
     `docker exec ci sh -c 'ls -1A "$1" | wc -l' sh /runner/_diag`,
     'docker exec ci test -f /runner/.runner',
     'docker exec ci du -sb /runner/_diag',
@@ -176,13 +176,16 @@ test('gate runs only the reporter commands, only on .runner and _diag', { skip: 
   }
   for (const command of [
     'docker exec ci cat /runner/.credentials',
-    `docker exec ci sh -c 'tail -c +1 "$1"' sh /runner/.credentials`,
+    `docker exec ci sh -c 'test -f "$1" && test ! -L "$1" && tail -c +1 "$1"' sh /runner/.credentials`,
+    `docker exec ci sh -c 'tail -c +1 "$1"' sh /runner/.runner`,
+    "docker exec ci du -sb '/runner/_diag/a\n'",
     `docker exec ci sh -c 'cat "$1"' sh /runner/.runner`,
     'docker exec ci stat -c %s /runner/_diag/../.credentials',
     'docker exec ci ls -1A /runner/_diag; cat /runner/.credentials',
     'docker exec other ls -1A /runner/_diag',
     'docker run --rm alpine id',
     'ps -A -o command',
+    `sh -c 'ps -A -o command | grep -F -- "$1/bin/Runner." || true' sh /runner`,
     '"unterminated',
     '',
   ]) {
@@ -190,23 +193,26 @@ test('gate runs only the reporter commands, only on .runner and _diag', { skip: 
     assert.equal(p.status, 126, command);
     assert.equal(p.stdout, '');
   }
-  assert.equal(gate('ps -A -o command', '--dir', '/opt/actions-runner').status, 0);
+  assert.equal(gate(`sh -c 'ps -A -o command | grep -F -- "$1/bin/Runner." || true' sh /opt/actions-runner`, '--dir', '/opt/actions-runner').status, 0);
+  assert.equal(gate('ps -A -o command', '--dir', '/opt/actions-runner').status, 126);
   assert.equal(gate('docker top ci -eo pid,args', '--dir', '/opt/actions-runner').status, 126);
 });
 
-test('reporter reads a runner over SSH through the gate', { skip: (!python && 'python3 not installed') || (process.platform !== 'linux' && 'remote commands need GNU stat/du') }, async () => {
+test('reporter reads a runner over SSH through the gate', { timeout: 30_000, skip: (!python && 'python3 not installed') || (process.platform !== 'linux' && 'remote commands need GNU stat/du') }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'dcr-ssh-'));
   const runner = join(root, 'actions-runner'), diag = join(runner, '_diag'), home = join(root, 'home'), bin = join(root, 'bin');
   mkdirSync(diag, { recursive: true }); mkdirSync(home); mkdirSync(bin);
   writeFileSync(join(runner, '.runner'), JSON.stringify({ agentName: 'studio-tart-arm64-1', poolName: 'Default', gitHubUrl: 'https://github.com/dashpay/dash' }));
   writeFileSync(join(runner, '.credentials'), 'secret');
-  const t = Date.now() - 3_600_000;
+  const t = Date.now() - 2 * 3_600_000;
   writeFileSync(join(diag, `Runner_${fileStamp(t)}-utc.log`), `[${stamp(t)}Z INFO Listener] Version: 2.338.0\n` + line(t + 1000, 'Running job: build-depends')
-    + line(t + 60_000, 'Job build-depends completed with result: Succeeded'));
+    + line(t + 60_000, 'Job build-depends completed with result: Succeeded') + line(t + 600_000, 'Running job: lint') + line(t + 660_000, 'Job lint completed with result: Failed'));
+  // A job planted a FIFO as lint's worker log: reading it must not hang the reporter (the test's timeout).
+  spawnSync('mkfifo', [join(diag, `Worker_${fileStamp(t + 600_000)}-utc.log`)]);
   writeFileSync(join(diag, `Worker_${fileStamp(t + 2000)}-utc.log`), '{ "jobDisplayName": "build-depends", "x": [{ "k": "repository", "v": "dashpay/dash" }, { "k": "run_id", "v": "9" }] }\n');
   // ssh: record the options, then hand the remote command line to the gate as sshd would.
   const sshLog = join(root, 'ssh.log');
-  writeFileSync(join(bin, 'ssh'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${sshLog}'\nfor a; do last=$a; done\nSSH_ORIGINAL_COMMAND=$last exec python3 '${GATE}' --dir '${runner}'\n`);
+  writeFileSync(join(bin, 'ssh'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${sshLog}'\nfor a; do last=$a; done\nSSH_ORIGINAL_COMMAND=$last exec python3 '${GATE}' --dir '${runner}' -- env\n`);
   chmodSync(join(bin, 'ssh'), 0o755);
 
   const bodies = [];
@@ -225,8 +231,8 @@ test('reporter reads a runner over SSH through the gate', { skip: (!python && 'p
     assert.equal(p.status, 0, p.stderr);
     const [r] = bodies.at(-1).runners;
     assert.equal(r.error, undefined);
-    assert.deepEqual([r.kind, r.name, r.version, r.listening, r.busy, r.diag.files], ['native', 'studio-tart-arm64-1', '2.338.0', false, false, 2]);
-    assert.deepEqual(bodies.at(-1).jobs.map((j) => [j.name, j.result, j.repo, j.runId]), [['build-depends', 'Succeeded', 'dashpay/dash', 9]]);
+    assert.deepEqual([r.key, r.kind, r.name, r.version, r.listening, r.busy, r.diag.files], [`ci@vm-host:${runner}`, 'native', 'studio-tart-arm64-1', '2.338.0', false, false, 3]);
+    assert.deepEqual(bodies.at(-1).jobs.map((j) => [j.name, j.result, j.repo, j.runId]), [['build-depends', 'Succeeded', 'dashpay/dash', 9], ['lint', 'Failed', undefined, undefined]]);
     const calls = readFileSync(sshLog, 'utf8').trim().split('\n');
     assert.ok(calls.length > 3 && calls.every((c) => c.startsWith('-o BatchMode=yes -o ConnectTimeout=10 ci@vm-host ')), calls.join('\n'));
   } finally { server.close(); }

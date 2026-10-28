@@ -144,12 +144,15 @@ DASH_CI_TOKEN=dcr_... DASH_CI_RUNNERS='[{"dir":"'$HOME'/actions-runner"}]' sh ci
 ```
 
 A runner in a VM (or on any machine the host can SSH to) is listed with `ssh`,
-the arguments that reach it: `{"ssh": ["-i", "/path/key", "user@localhost"],
-"container": "name"}`, or with `"dir"` for a runner installed there. Its key's
-`authorized_keys` line should force
+the arguments that reach it, ending with the destination: `{"ssh": ["-i",
+"/path/key", "-o", "IdentitiesOnly=yes", "user@localhost"], "container": "name"}`,
+or with `"dir"` for a runner installed there. SSH runs in batch mode, so the far
+end's host key must already be in known_hosts. The key's `authorized_keys` line
+should force
 [ci/reporter/dash-ci-gate.py](ci/reporter/dash-ci-gate.py), which runs only the
 reporter's read-only commands on that runner's `.runner` and `_diag` (not its
-credentials), through a prefix such as the VM's exec command:
+credentials) and lists only its processes, through a prefix such as the VM's
+exec command:
 
 ```text
 restrict,from="127.0.0.1,::1",command="/usr/bin/python3 /path/dash-ci-gate.py --dir /runner --container name -- /path/vm-exec" ssh-ed25519 AAAA...

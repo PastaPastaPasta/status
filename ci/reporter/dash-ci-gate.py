@@ -17,9 +17,10 @@ import re
 import shlex
 import sys
 
-NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
-TAIL = re.compile(r'^tail -c \+[0-9]+ "\$1"( \| head -c [0-9]+)?$')
+NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
+TAIL = re.compile(r'test -f "\$1" && test ! -L "\$1" && tail -c \+[0-9]+ "\$1"( \| head -c [0-9]+)?')
 COUNT = 'ls -1A "$1" | wc -l'
+PS = 'ps -A -o command | grep -F -- "$1/bin/Runner." || true'
 INSPECT = '{{json .State}}|{{.RestartCount}}|{{.Config.Image}}'
 
 
@@ -27,28 +28,25 @@ def allowed(argv, directory, container):
     diag = directory + '/_diag'
 
     def path(p):  # .runner, _diag, or a file directly in _diag
-        return p in (directory + '/.runner', diag) or (p.startswith(diag + '/') and NAME.match(p[len(diag) + 1:]) is not None)
+        return p in (directory + '/.runner', diag) or (p.startswith(diag + '/') and NAME.fullmatch(p[len(diag) + 1:]) is not None)
 
     def command(a):
-        if len(a) == 3 and a[:2] in (['ls', '-1A'], ['test', '-f'], ['du', '-sb']) or len(a) == 4 and a[:3] == ['stat', '-c', '%s']:
+        if a[:-1] in (['ls', '-1A'], ['test', '-f'], ['du', '-sb'], ['stat', '-c', '%s']):
             return path(a[-1])
-        if len(a) == 5 and a[:2] == ['sh', '-c'] and a[3] == 'sh':
-            return (a[2] == COUNT or TAIL.match(a[2]) is not None) and path(a[4])
-        return False
+        return len(a) == 5 and a[:2] == ['sh', '-c'] and a[3] == 'sh' and (a[2] == COUNT or TAIL.fullmatch(a[2]) is not None) and path(a[4])
 
-    if not container:
-        return argv == ['ps', '-A', '-o', 'command'] or command(argv)
+    if not container:  # the runner's processes, not every command line on the machine
+        return argv == ['sh', '-c', PS, 'sh', directory] or command(argv)
     return (argv in (['docker', 'top', container, '-eo', 'pid,args'], ['docker', 'inspect', '-f', INSPECT, container])
             or argv[:3] == ['docker', 'exec', container] and command(argv[3:]))
 
 
 def main(argv):
-    split = argv.index('--') if '--' in argv else len(argv)
-    parser = argparse.ArgumentParser(prog='dash-ci-gate.py', usage='%(prog)s --dir DIR [--container NAME] [-- PREFIX...]')
+    parser = argparse.ArgumentParser(prog='dash-ci-gate.py')
     parser.add_argument('--dir', required=True, help="the runner's install directory, as the runner's machine sees it")
     parser.add_argument('--container', help='the Docker container the runner is in, if any')
-    opts = parser.parse_args(argv[:split])
-    prefix = argv[split + 1:]
+    parser.add_argument('prefix', nargs='*', help='after --: the command that runs a command where the runner is')
+    opts = parser.parse_args(argv)
     try:
         command = shlex.split(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
     except ValueError:
@@ -56,7 +54,7 @@ def main(argv):
     if not command or not allowed(command, opts.dir.rstrip('/'), opts.container):
         print('dash-ci-gate: refused', file=sys.stderr)
         return 126
-    full = prefix + command
+    full = opts.prefix + command
     os.execvp(full[0], full)
 
 
