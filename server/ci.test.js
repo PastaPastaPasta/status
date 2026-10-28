@@ -41,6 +41,7 @@ test('reporter tokens authenticate; reports are stored, deduplicated and summari
   assert.equal(s.recent[0].url, 'https://github.com/dashpay/platform/actions/runs/160');
   assert.equal(s.workflows[0].jobs, 2);
   assert.equal(s.daily.length, 14);
+  assert.deepEqual([s.daily.at(-1).succeeded, s.daily.at(-1).failed, s.daily.at(-1).runnerHours, s.daily.at(-1).light], [1, 1, 1, 0]);
   assert.equal(s.reporters[0].id, id);
   assert.equal(ci.summary().reporters, undefined);
 
@@ -142,7 +143,9 @@ test('dash-ci-pool hosts: pools count as capacity, single-use runner jobs are ti
   assert.deepEqual(ci.summary().pools.map((x) => x.day.jobs), [2, 0]);
   ci.ingest(id, { ...report(), runners: [], pools: [pool] });
   assert.equal(p.hours.length, 48);
-  assert.deepEqual([s.totals.runners, s.totals.online, s.totals.busy, s.totals.jobs24h], [4, 3, 1, 2]);
+  assert.deepEqual([s.totals.runners, s.totals.online, s.totals.busy, s.totals.jobs24h, s.totals.failed24h, s.totals.light24h], [4, 3, 1, 0, 0, 2]);
+  // Light-pool jobs are counted apart from the real ones, not in the daily columns.
+  assert.deepEqual([s.daily.at(-1).succeeded, s.daily.at(-1).failed, s.daily.at(-1).light, s.daily.at(-1).lightRunnerHours], [0, 0, 2, 0.02]);
   // The runner is gone, but its job is matched on GitHub by the name it ran under.
   const timed = s.recent.find((j) => j.runnerName === 'r730-light-cccccc');
   assert.equal(timed.queueSec, 5);

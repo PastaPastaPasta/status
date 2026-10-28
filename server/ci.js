@@ -30,6 +30,10 @@ const repoOf = (v) => (typeof v === 'string' && REPO.test(v) && !v.split('/').so
 export const median = (xs) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return s[Math.floor((s.length - 1) / 2)]; };
 export const pctile = (xs, p) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
 const overlap = (a0, a1, b0, b1) => Math.max(0, Math.min(a1, b1) - Math.max(a0, b0));
+// dash-ci-pool's light pool (dash-x64-light) runs seconds-long housekeeping jobs
+// (cache checks, labelers, PR policy): thousands a day that would drown the real
+// jobs, so job counts and the daily chart keep them apart.
+const isLight = (j) => j.pool === 'light';
 
 function cleanJob(j, hostId) {
   const start = ts(j?.start);
@@ -330,13 +334,16 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
       return { repo: g.repo, workflow: g.workflow, jobs: g.jobs.length, failed: g.jobs.filter((j) => j.result === 'Failed').length, canceled: g.jobs.filter((j) => j.result === 'Canceled' || j.result === 'Abandoned').length,
         medianSec: median(d), p90Sec: pctile(d, 0.9), runnerHours: Math.round(d.reduce((a, b) => a + b, 0) / 36) / 100, medianQueueSec: median(q), p90QueueSec: pctile(q, 0.9) };
     }).sort((a, b) => b.runnerHours - a.runnerHours);
+    const hoursOf = (js) => Math.round(js.reduce((a, j) => a + (dur(j) || 0), 0) / 36) / 100;
     const daily = [];
     for (let i = 13; i >= 0; i--) {
       const start = Math.floor(now / DAY) * DAY - i * DAY, end = start + DAY;
-      const js = jobs.filter((j) => { const t = Date.parse(j.start); return t >= start && t < end; });
+      const all = jobs.filter((j) => { const t = Date.parse(j.start); return t >= start && t < end; });
+      const js = all.filter((j) => !isLight(j)), light = all.filter(isLight);
       daily.push({ day: new Date(start).toISOString().slice(0, 10), succeeded: js.filter((j) => j.result === 'Succeeded').length, failed: js.filter((j) => j.result === 'Failed').length,
-        other: js.filter((j) => j.result !== 'Succeeded' && j.result !== 'Failed').length, runnerHours: Math.round(js.reduce((a, j) => a + (dur(j) || 0), 0) / 36) / 100 });
+        other: js.filter((j) => j.result !== 'Succeeded' && j.result !== 'Failed').length, runnerHours: hoursOf(js), light: light.length, lightRunnerHours: hoursOf(light) });
     }
+    const real24h = day.filter((j) => !isLight(j));
     const dq = day.map((j) => j.queueSec).filter((x) => x != null);
     const online = runners.filter((r) => r.status === 'busy' || r.status === 'idle');
     const sum = (k) => pools.reduce((a, p) => a + p[k], 0);
@@ -346,7 +353,7 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
       at: new Date(now).toISOString(),
       totals: {
         runners: capacity, online: online.length + sum('online'), starting: sum('starting'), busy: runners.filter((r) => r.status === 'busy').length + sum('busy'),
-        jobs24h: day.length, succeeded24h: day.filter((j) => j.result === 'Succeeded').length, failed24h: day.filter((j) => j.result === 'Failed').length,
+        jobs24h: real24h.length, succeeded24h: real24h.filter((j) => j.result === 'Succeeded').length, failed24h: real24h.filter((j) => j.result === 'Failed').length, light24h: day.length - real24h.length,
         utilization24h: capacity ? busySec / (capacity * 86_400) : null,
         medianQueueSec24h: median(dq), p90QueueSec24h: pctile(dq, 0.9), queuedNow: queued.length, oldestQueuedAt: queued[0]?.createdAt || null,
       },

@@ -48,8 +48,8 @@ export default function CI() {
         <Stat label="Runners online" value={`${t.online}/${t.runners}`} level={t.online + t.starting < t.runners ? 'down' : 'ok'} sub={`${t.busy} busy now${t.starting ? ` · ${t.starting} starting` : ''}`} />
         <Stat label="Waiting for a runner" value={data.queue ? t.queuedNow : '—'} level={t.queuedNow > 0 ? 'warn' : undefined}
           sub={t.oldestQueuedAt ? `oldest ${ago(t.oldestQueuedAt, now)}` : data.queue ? `checked ${ago(data.queue.at, now)} ago` : 'GitHub not polled yet'} />
-        <Stat label="Jobs · 24h" value={t.jobs24h} sub={`${t.succeeded24h} ok · ${t.failed24h} failed`} />
-        <Stat label="Success · 24h" value={t.jobs24h ? pct((t.succeeded24h / t.jobs24h) * 100) : '—'} level={t.jobs24h && t.failed24h / t.jobs24h > 0.2 ? 'warn' : undefined} sub="of all finished jobs" />
+        <Stat label="Jobs · 24h" value={t.jobs24h} sub={`${t.succeeded24h} ok · ${t.failed24h} failed${t.light24h ? ` · +${t.light24h} light` : ''}`} />
+        <Stat label="Success · 24h" value={t.jobs24h ? pct((t.succeeded24h / t.jobs24h) * 100) : '—'} level={t.jobs24h && t.failed24h / t.jobs24h > 0.2 ? 'warn' : undefined} sub="of finished jobs, not light" />
         <Stat label="Utilisation · 24h" value={t.utilization24h != null ? pct(t.utilization24h * 100) : '—'} sub="busy time, all runners" />
         <Stat label="Queue time · 24h" value={secs(t.medianQueueSec24h)} sub={t.p90QueueSec24h != null ? `p90 ${secs(t.p90QueueSec24h)}` : 'median, public repos'} level={t.p90QueueSec24h > 900 ? 'warn' : undefined} />
       </div>
@@ -198,18 +198,18 @@ function PoolRow({ p, now, bind }) {
 function DailyJobs({ daily, bind }) {
   const [table, setTable] = useState(false);
   return (
-    <Section title="Jobs per day · 14 days" right={<button className="text-dim hover:text-fg text-[11px]" onClick={() => setTable(!table)}>{table ? 'chart' : 'table'}</button>}>
+    <Section title="Jobs per day · 14 days" right={<span className="flex gap-3 items-baseline"><span className="text-faint text-[11px]">light-pool jobs not charted</span><button className="text-dim hover:text-fg text-[11px]" onClick={() => setTable(!table)}>{table ? 'chart' : 'table'}</button></span>}>
       <div className="panel p-3">
         {table ? (
           <table className="grid w-full text-[12px]">
-            <thead><tr><th>Day</th><th className="text-right">Succeeded</th><th className="text-right">Failed</th><th className="text-right">Other</th><th className="text-right">Runner-hours</th></tr></thead>
-            <tbody>{daily.map((d) => <tr key={d.day}><td className="mono">{d.day}</td><td className="mono text-right">{d.succeeded}</td><td className="mono text-right">{d.failed}</td><td className="mono text-right">{d.other}</td><td className="mono text-right">{d.runnerHours}</td></tr>)}</tbody>
+            <thead><tr><th>Day</th><th className="text-right">Succeeded</th><th className="text-right">Failed</th><th className="text-right">Other</th><th className="text-right">Runner-hours</th><th className="text-right">Light jobs</th><th className="text-right">Light runner-h</th></tr></thead>
+            <tbody>{daily.map((d) => <tr key={d.day}><td className="mono">{d.day}</td><td className="mono text-right">{d.succeeded}</td><td className="mono text-right">{d.failed}</td><td className="mono text-right">{d.other}</td><td className="mono text-right">{d.runnerHours}</td><td className="mono text-right text-dim">{d.light}</td><td className="mono text-right text-dim">{d.lightRunnerHours}</td></tr>)}</tbody>
           </table>
         ) : (
           <>
             <div className="mb-2"><Legend series={JOB_SERIES} /></div>
             <Columns rows={daily} series={JOB_SERIES} bind={bind} xLabel={(d) => d.day.slice(5)}
-              tip={(d) => (<><div className="text-dim mb-0.5">{d.day}</div>{[...JOB_SERIES].reverse().map((s) => <TipRow key={s.key} color={s.color} value={d[s.key]} label={s.label.toLowerCase()} />)}<TipRow value={d.runnerHours} label="runner-hours" /></>)} />
+              tip={(d) => (<><div className="text-dim mb-0.5">{d.day}</div>{[...JOB_SERIES].reverse().map((s) => <TipRow key={s.key} color={s.color} value={d[s.key]} label={s.label.toLowerCase()} />)}<TipRow value={d.runnerHours} label="runner-hours" />{d.light > 0 && <TipRow value={d.light} label="light jobs, not charted" />}</>)} />
           </>
         )}
       </div>
