@@ -4,12 +4,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT = fileURLToPath(new URL('./dash-ci-reporter.py', import.meta.url));
+const GATE = fileURLToPath(new URL('./dash-ci-gate.py', import.meta.url));
 const python = spawnSync('python3', ['--version']).status === 0;
 const stamp = (ms) => new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
 const fileStamp = (ms) => new Date(ms).toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-');
@@ -128,7 +129,7 @@ test('reporter sends dash-ci-pool pools and each single-use runner job once', { 
     let p = await run();
     assert.equal(p.status, 0, p.stderr);
     const first = bodies.at(-1);
-    assert.equal(first.reporter, '2');
+    assert.equal(first.reporter, '3');
     const [light, missing] = first.pools;
     assert.deepEqual([light.name, light.controller, light.size, light.busy, light.backend, light.error], ['light', 'r730', 12, 1, 'proxmox-lxc', null]);
     assert.deepEqual(light.instances.map((i) => [i.name, i.state]), [['r730-light-aaaaaa', 'busy'], ['r730-light-bbbbbb', 'idle']]);
@@ -152,5 +153,81 @@ test('reporter sends dash-ci-pool pools and each single-use runner job once', { 
     const sent = async () => { let n = 0; for (let i = 0; i < 12; i++) { p = await run(); assert.equal(p.status, 0, p.stderr); n += bodies.at(-1).jobs.length; } return n; };
     assert.equal(await sent(), 2500);
     assert.equal(await sent(), 0);
+  } finally { server.close(); }
+});
+
+test('gate runs only the reporter commands, only on .runner and _diag', { skip: !python && 'python3 not installed' }, () => {
+  const gate = (command, ...args) => spawnSync('python3', [GATE, ...args, '--', 'echo'], { env: { ...process.env, SSH_ORIGINAL_COMMAND: command }, encoding: 'utf8' });
+  const docker = ['--dir', '/runner', '--container', 'ci'];
+  for (const command of [
+    'docker exec ci ls -1A /runner/_diag',
+    'docker exec ci stat -c %s /runner/_diag/Runner_20261028-000000-utc.log',
+    `docker exec ci sh -c 'tail -c +1 "$1" | head -c 131072' sh /runner/_diag/Worker_20261028-000000-utc.log`,
+    `docker exec ci sh -c 'tail -c +4097 "$1"' sh /runner/.runner`,
+    `docker exec ci sh -c 'ls -1A "$1" | wc -l' sh /runner/_diag`,
+    'docker exec ci test -f /runner/.runner',
+    'docker exec ci du -sb /runner/_diag',
+    'docker top ci -eo pid,args',
+    `docker inspect -f '{{json .State}}|{{.RestartCount}}|{{.Config.Image}}' ci`,
+  ]) {
+    const p = gate(command, ...docker);
+    assert.equal(p.status, 0, `${command}: ${p.stderr}`);
+    assert.match(p.stdout, /^docker /);
+  }
+  for (const command of [
+    'docker exec ci cat /runner/.credentials',
+    `docker exec ci sh -c 'tail -c +1 "$1"' sh /runner/.credentials`,
+    `docker exec ci sh -c 'cat "$1"' sh /runner/.runner`,
+    'docker exec ci stat -c %s /runner/_diag/../.credentials',
+    'docker exec ci ls -1A /runner/_diag; cat /runner/.credentials',
+    'docker exec other ls -1A /runner/_diag',
+    'docker run --rm alpine id',
+    'ps -A -o command',
+    '"unterminated',
+    '',
+  ]) {
+    const p = gate(command, ...docker);
+    assert.equal(p.status, 126, command);
+    assert.equal(p.stdout, '');
+  }
+  assert.equal(gate('ps -A -o command', '--dir', '/opt/actions-runner').status, 0);
+  assert.equal(gate('docker top ci -eo pid,args', '--dir', '/opt/actions-runner').status, 126);
+});
+
+test('reporter reads a runner over SSH through the gate', { skip: (!python && 'python3 not installed') || (process.platform !== 'linux' && 'remote commands need GNU stat/du') }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dcr-ssh-'));
+  const runner = join(root, 'actions-runner'), diag = join(runner, '_diag'), home = join(root, 'home'), bin = join(root, 'bin');
+  mkdirSync(diag, { recursive: true }); mkdirSync(home); mkdirSync(bin);
+  writeFileSync(join(runner, '.runner'), JSON.stringify({ agentName: 'studio-tart-arm64-1', poolName: 'Default', gitHubUrl: 'https://github.com/dashpay/dash' }));
+  writeFileSync(join(runner, '.credentials'), 'secret');
+  const t = Date.now() - 3_600_000;
+  writeFileSync(join(diag, `Runner_${fileStamp(t)}-utc.log`), `[${stamp(t)}Z INFO Listener] Version: 2.338.0\n` + line(t + 1000, 'Running job: build-depends')
+    + line(t + 60_000, 'Job build-depends completed with result: Succeeded'));
+  writeFileSync(join(diag, `Worker_${fileStamp(t + 2000)}-utc.log`), '{ "jobDisplayName": "build-depends", "x": [{ "k": "repository", "v": "dashpay/dash" }, { "k": "run_id", "v": "9" }] }\n');
+  // ssh: record the options, then hand the remote command line to the gate as sshd would.
+  const sshLog = join(root, 'ssh.log');
+  writeFileSync(join(bin, 'ssh'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${sshLog}'\nfor a; do last=$a; done\nSSH_ORIGINAL_COMMAND=$last exec python3 '${GATE}' --dir '${runner}'\n`);
+  chmodSync(join(bin, 'ssh'), 0o755);
+
+  const bodies = [];
+  const server = createServer((req, res) => {
+    let b = ''; req.on('data', (c) => { b += c; });
+    req.on('end', () => { bodies.push(JSON.parse(b)); res.setHeader('content-type', 'application/json'); res.end('{}'); });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ url: `http://127.0.0.1:${server.address().port}/api/ci/report`, token: 'dcr_test_token', runners: [{ ssh: ['ci@vm-host'], dir: runner }] }));
+  try {
+    const p = await new Promise((resolve) => {
+      const c = spawn('python3', [SCRIPT], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, DASH_CI_REPORTER_HOME: home } });
+      let stderr = ''; c.stderr.on('data', (d) => { stderr += d; });
+      c.on('close', (status) => resolve({ status, stderr }));
+    });
+    assert.equal(p.status, 0, p.stderr);
+    const [r] = bodies.at(-1).runners;
+    assert.equal(r.error, undefined);
+    assert.deepEqual([r.kind, r.name, r.version, r.listening, r.busy, r.diag.files], ['native', 'studio-tart-arm64-1', '2.338.0', false, false, 2]);
+    assert.deepEqual(bodies.at(-1).jobs.map((j) => [j.name, j.result, j.repo, j.runId]), [['build-depends', 'Succeeded', 'dashpay/dash', 9]]);
+    const calls = readFileSync(sshLog, 'utf8').trim().split('\n');
+    assert.ok(calls.length > 3 && calls.every((c) => c.startsWith('-o BatchMode=yes -o ConnectTimeout=10 ci@vm-host ')), calls.join('\n'));
   } finally { server.close(); }
 });

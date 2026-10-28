@@ -129,8 +129,9 @@ read-only on the host. It POSTs to `/api/ci/report` with the host's own bearer
 token. Each report carries:
 
 - host load, memory, disk and Docker usage;
-- per runner (native directory or Docker container): registration, runner
-  version, listener/worker state, the running job and the size of `_diag`;
+- per runner (native directory or Docker container, on the host or reached over
+  SSH, e.g. in a VM): registration, runner version, listener/worker state, the
+  running job and the size of `_diag`;
 - every finished job, parsed from the listener log (`Runner_*.log`), with
   repository, workflow, run and branch taken from the job's worker log.
 
@@ -140,6 +141,18 @@ on the CI page, then:
 ```sh
 DASH_CI_TOKEN=dcr_... DASH_CI_RUNNERS='[{"dir":"'$HOME'/actions-runner"}]' sh ci/reporter/install.sh
 # a runner in Docker: DASH_CI_RUNNERS='[{"container":"dash-ci-runner"}]'
+```
+
+A runner in a VM (or on any machine the host can SSH to) is listed with `ssh`,
+the arguments that reach it: `{"ssh": ["-i", "/path/key", "user@localhost"],
+"container": "name"}`, or with `"dir"` for a runner installed there. Its key's
+`authorized_keys` line should force
+[ci/reporter/dash-ci-gate.py](ci/reporter/dash-ci-gate.py), which runs only the
+reporter's read-only commands on that runner's `.runner` and `_diag` (not its
+credentials), through a prefix such as the VM's exec command:
+
+```text
+restrict,from="127.0.0.1,::1",command="/usr/bin/python3 /path/dash-ci-gate.py --dir /runner --container name -- /path/vm-exec" ssh-ed25519 AAAA...
 ```
 
 The web adds queue times (GitHub job `created_at` → `started_at`) and the jobs

@@ -6,7 +6,9 @@
 #
 # DASH_CI_RUNNERS lists runner installs: {"dir": ...} for a runner installed on
 # the host, {"container": "name"} (optionally "dir", default /runner) for one in
-# Docker. DASH_CI_POOLS lists dash-ci-pool status directories, usually
+# Docker, and "ssh" (a list of ssh arguments, with "dir" or "container") for one
+# on a machine reached over SSH, such as a VM; see dash-ci-gate.py for the key on
+# that end. DASH_CI_POOLS lists dash-ci-pool status directories, usually
 # '["/run/dash-ci-pool"]'. Set either or both. Admins issue tokens on the status
 # board's CI page.
 set -eu

@@ -6,9 +6,16 @@ Read-only on the host. Python 3.9+ standard library only (macOS ships 3.9).
 
   ~/.dash-ci-reporter/config.json   {"url": ".../api/ci/report", "token": "...",
                                      "runners": [{"dir": "/path/actions-runner"},
-                                                 {"container": "name", "dir": "/runner"}],
+                                                 {"container": "name", "dir": "/runner"},
+                                                 {"ssh": ["-i", "/path/key", "user@vm-host"],
+                                                  "container": "name"}],
                                      "pools": ["/run/dash-ci-pool"]}
   ~/.dash-ci-reporter/state.json    log offsets, jobs not yet delivered
+
+"ssh" reaches a runner on another machine, a VM say (with "dir", or "container"
+for one in Docker there): its commands go as one shell-quoted SSH command, to a
+Linux machine or container (GNU stat/du). Restrict the key on the far end with
+dash-ci-gate.py, which runs only these commands and only on .runner and _diag.
 
 "pools" are dash-ci-pool hosts (single-use runners, one job each): pool state
 comes from its status.json and finished jobs from its jobs.jsonl, which the
@@ -25,6 +32,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -33,7 +41,7 @@ import time
 import urllib.error
 import urllib.request
 
-REPORTER_VERSION = '2'
+REPORTER_VERSION = '3'
 BACKFILL_DAYS = 14
 MAX_PENDING = 5000
 BATCH = 250
@@ -117,8 +125,10 @@ class Native:
         return os.path.isfile(self.path('.runner'))
 
     def processes(self):
-        out = run(['ps', '-axo', 'command'] if sys.platform == 'darwin' else ['ps', '-eo', 'args']).decode(errors='replace')
-        mine = [l for l in out.splitlines() if self.dir + '/bin/Runner.' in l]
+        return self.listener_worker(run(['ps', '-axo', 'command'] if sys.platform == 'darwin' else ['ps', '-eo', 'args']))
+
+    def listener_worker(self, ps):
+        mine = [l for l in ps.decode(errors='replace').splitlines() if self.dir + '/bin/Runner.' in l]
         return any('Runner.Listener' in l for l in mine), any('Runner.Worker' in l for l in mine)
 
     def dir_bytes(self, rel):
@@ -137,17 +147,26 @@ class Native:
         return None
 
 
-class Docker(Native):
-    """A runner inside a container (its install directory is inside, e.g. /runner)."""
-    kind = 'docker'
+class Remote(Native):
+    """A runner reached through commands: inside a container (its install directory
+    is inside, e.g. /runner), on another machine over SSH, or in a container there."""
 
-    def __init__(self, container, directory='/runner'):
+    def __init__(self, directory, container=None, ssh=None):
         super().__init__(directory)
         self.container = container
-        self.docker = tool('docker') or 'docker'
+        self.ssh = ssh
+        self.kind = 'docker' if container else 'native'
+        self.docker = 'docker' if ssh else tool('docker') or 'docker'
+
+    def run(self, args, timeout=30):
+        """`args` on the runner's machine. SSH sends one command line, which the far
+        end's shell (or dash-ci-gate.py) splits again, so it goes shell-quoted."""
+        if self.ssh:
+            return run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'] + self.ssh + [shlex.join(args)], timeout=timeout)
+        return run(args, timeout=timeout)
 
     def exec(self, *args, timeout=30):
-        return run([self.docker, 'exec', self.container] + list(args), timeout=timeout)
+        return self.run(([self.docker, 'exec', self.container] if self.container else []) + list(args), timeout=timeout)
 
     def listdir(self, rel):
         return [l for l in self.exec('ls', '-1A', self.path(rel)).decode(errors='replace').splitlines() if l]
@@ -167,7 +186,9 @@ class Docker(Native):
             return False
 
     def processes(self):
-        out = run([self.docker, 'top', self.container, '-eo', 'pid,args']).decode(errors='replace')
+        if not self.container:
+            return self.listener_worker(self.run(['ps', '-A', '-o', 'command']))
+        out = self.run([self.docker, 'top', self.container, '-eo', 'pid,args']).decode(errors='replace')
         return 'Runner.Listener' in out, 'Runner.Worker' in out
 
     def dir_bytes(self, rel):
@@ -176,7 +197,9 @@ class Docker(Native):
         return total, files
 
     def container_state(self):
-        raw = run([self.docker, 'inspect', '-f', '{{json .State}}|{{.RestartCount}}|{{.Config.Image}}', self.container]).decode().strip()
+        if not self.container:
+            return None
+        raw = self.run([self.docker, 'inspect', '-f', '{{json .State}}|{{.RestartCount}}|{{.Config.Image}}', self.container]).decode().strip()
         state, restarts, image = raw.rsplit('|', 2)
         s = json.loads(state)
         return dict(status=s.get('Status'), startedAt=s.get('StartedAt'), restarts=int(restarts), image=image[:200])
@@ -448,7 +471,9 @@ def collect(config, state, now):
     slow = state.setdefault('slow', {})
     runners = []
     for spec in config.get('runners', []):
-        r = Docker(spec['container'], spec.get('dir', '/runner')) if spec.get('container') else Native(spec['dir'])
+        container, ssh = spec.get('container'), spec.get('ssh')
+        directory = spec.get('dir', '/runner') if container else spec['dir']
+        r = Remote(directory, container, ssh) if container or ssh else Native(directory)
         key = spec.get('container') or r.dir
         st = state.setdefault('runners', {}).setdefault(key, {})
         info = dict(key=key, kind=r.kind, container=r.container, dir=r.dir)
