@@ -5,7 +5,8 @@
 // runner (and name) per job, so a pool is shown as one row with its capacity.
 //
 //   data/ci/reporters.json      reporter id -> { label, hash (sha256 of token) }
-//   data/ci/hosts/<id>.json     latest report of that host (+ hours it reported)
+//   data/ci/hosts/<id>.json     latest report of that host (+ hours it reported,
+//                               busy spans of its pool runners)
 //   data/ci/jobs/<id>.json      its finished jobs, 30 days
 //   data/ci/github.json         per-run GitHub job timing, current queue
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
@@ -16,6 +17,9 @@ import { readJSON, writeAtomic } from '../shared/settings.js';
 const DAY = 86_400_000;
 const KEEP_DAYS = 30;
 const STALE_MS = 3 * 60_000;
+// Busy spans are kept for the 48-hour strip; one per single-use runner.
+const SPAN_KEEP_MS = 49 * 3_600_000;
+const SPAN_MAX = 2000;
 const ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 const TS = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
@@ -123,8 +127,23 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
     const hour = new Date(now).toISOString().slice(0, 13);
     const seen = Object.fromEntries(Object.entries({ ...(prior.seen || {}), [hour]: 1 }).filter(([h]) => Date.parse(`${h}:00:00Z`) > now - 3 * DAY));
     const { jobs, ...rest } = report;
-    writeAtomic(hostPath, JSON.stringify({ id, receivedAt: new Date(now).toISOString(), ...rest, seen }));
     const incoming = jobs.map((j) => cleanJob(j, id)).filter(Boolean);
+    // Pools whose runners run in VMs keep no job ledger (their disks are not
+    // trusted), so their busy time is sampled here: the controller reports each
+    // busy runner and since when GitHub has called it busy. A span ends at the
+    // last report that still lists it busy; once the ledger has the finished job, it wins.
+    const spans = { ...(prior.spans || {}) };
+    // `since` is on the reporting host's clock: measured back from its own `at`.
+    const skew = report.at ? now - Date.parse(report.at) : 0;
+    for (const p of report.pools) for (const i of p.instances) {
+      if (i.state !== 'busy' || !i.since || (p.controller && !i.name.startsWith(`${p.controller}-${p.name}-`))) continue;
+      const since = Math.min(now, Math.max(now - 2 * DAY, Date.parse(i.since) + skew));
+      spans[i.name] = { pool: p.name, controller: p.controller, start: spans[i.name]?.start ?? since, end: now };
+    }
+    // A job that hit its time limit is recorded without an end: its span keeps the busy time.
+    for (const j of incoming) if (j.runnerName && j.end) delete spans[j.runnerName];
+    const keptSpans = Object.fromEntries(Object.entries(spans).filter(([, v]) => v.end > now - SPAN_KEEP_MS).sort((a, b) => b[1].end - a[1].end).slice(0, SPAN_MAX));
+    writeAtomic(hostPath, JSON.stringify({ id, receivedAt: new Date(now).toISOString(), ...rest, seen, spans: keptSpans }));
     if (incoming.length) {
       const path = join(dirs.jobs, `${id}.json`);
       const merged = new Map(readJSON(path, []).map((j) => [jobKey(j), j]));
@@ -302,8 +321,16 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
       for (const p of h.pools || []) {
         // One reporter may read several controllers: a job belongs to the one its runner name says.
         const mine = jobs.filter((j) => j.host === h.id && j.pool === p.name && (!p.controller || String(j.runnerName).startsWith(`${p.controller}-${p.name}-`)));
-        // Jobs shorter than a report interval only show up in the ledger, so busy time comes from it.
-        const busyIn = (a, b) => mine.reduce((s, j) => s + (j.end ? overlap(Date.parse(j.start), Date.parse(j.end), a, b) : 0), 0);
+        // Jobs shorter than a report interval only show up in the ledger, so busy time comes from it,
+        // plus the sampled spans of runners it has no job for (running now, or in a VM pool without a ledger).
+        const inLedger = new Set(mine.map((j) => j.runnerName)), finished = new Set(mine.filter((j) => j.end).map((j) => j.runnerName));
+        const live = Date.parse(h.receivedAt);
+        const sampled = Object.entries(h.spans || {})
+          .filter(([name, v]) => v.pool === p.name && (!p.controller || v.controller === p.controller) && !finished.has(name))
+          .map(([name, v]) => ({ name, start: v.start, end: v.end === live && !stale ? now : v.end }));
+        const busyIn = (a, b) => mine.reduce((s, j) => s + (j.end ? overlap(Date.parse(j.start), Date.parse(j.end), a, b) : 0), 0)
+          + sampled.reduce((s, v) => s + overlap(v.start, v.end, a, b), 0);
+        const day = dayStats(mine, busyIn);
         const size = p.size || 0, count = (k) => (stale ? 0 : p[k] || 0);
         const idle = count('idle'), busy = count('busy'), starting = count('starting'), online = idle + busy;
         // A new runner starts as each one finishes its job: only a shortfall beyond those is a problem.
@@ -313,7 +340,8 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
           // A drained pool is emptied on purpose; one that shrank still counts the runners it has.
           size, capacity: p.draining ? online + starting : Math.max(size, online + starting), online, idle, busy, starting, draining: p.draining, error: p.error,
           running: stale ? [] : p.instances.filter((i) => i.state === 'busy').map((i) => ({ name: i.name, since: i.since })),
-          day: dayStats(mine, busyIn),
+          // Sampled jobs have no result: they add to the count only (unless the ledger has the unfinished job).
+          day: { ...day, jobs: day.jobs + sampled.filter((v) => v.start > now - DAY && !inLedger.has(v.name)).length },
           hours: hourStrip(h, busyIn, size),
         });
       }
