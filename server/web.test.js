@@ -332,7 +332,15 @@ test('Actions queue: signed org webhook in, public and member views out', async 
     const full = await (await w.req('/api/ci/queue')).json();
     assert.equal(full.public, false);
     assert.deepEqual(full.waiting.map((j) => j.repo).sort(), ['dashpay/dash', 'dashpay/hotfix']);
+    const cap = await (await w.req('/api/ci/queue/capacity?window=24h')).json();
+    assert.deepEqual([cap.public, cap.window], [false, '24h']);
+    assert.deepEqual(cap.labels.map((g) => g.labels), [['dash-x64-light']]);
   } finally { w.close(); }
+  const anon = await start(9920871, [], { ciQueue: { secret: 'hook-secret' } });
+  try {
+    const cap = await (await anon.req('/api/ci/queue/capacity?window=14d')).json();
+    assert.deepEqual([cap.public, cap.window], [true, '14d']);
+  } finally { anon.close(); }
 });
 
 test('Actions queue webhook is off without a secret', async () => {

@@ -36,7 +36,7 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
   const clients = new Set();
   const cache = new Map();
   const ci = createCi({ dataDir, fetcher, clock, github: ciGithub, log: (...a) => console.log(new Date(clock()).toISOString(), ...a) });
-  const orgQueue = createOrgQueue({ dataDir, fetcher, clock, github: ciGithub, ...ciQueue, log: (...a) => console.log(new Date(clock()).toISOString(), ...a) });
+  const orgQueue = createOrgQueue({ dataDir, fetcher, clock, github: ciGithub, pools: ci.poolCapacity, ...ciQueue, log: (...a) => console.log(new Date(clock()).toISOString(), ...a) });
   const awsDir = join(dataDir, 'aws');
   mkdirSync(awsDir, { recursive: true });
 
@@ -375,6 +375,10 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
     return value;
   };
   app.get('/api/ci', (req, res) => res.json(memberOf(settings, user(req)) ? ci.summary({ admin: isAdmin(req) }) : cached('ci', () => ci.publicSummary())));
+  app.get('/api/ci/queue/capacity', (req, res) => {
+    const window = typeof req.query.window === 'string' ? req.query.window : '7d';
+    res.json(orgQueue.capacity({ full: !!memberOf(settings, user(req)), window }));
+  });
   app.get('/api/ci/queue', (req, res) => res.json(memberOf(settings, user(req)) ? orgQueue.summary({ full: true }) : cached('ci-queue', () => orgQueue.summary())));
   app.post('/api/ci/reporters', ...adminWrite, (req, res) => {
     try {

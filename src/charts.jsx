@@ -43,11 +43,29 @@ export function HourStrip({ hours, bind, label }) {
   );
 }
 
-export function StripLegend() {
+// Share of each bucket a label set was at capacity; buckets before recording began are hatched.
+export function CapacityStrip({ buckets, bucketSec, bind, label }) {
+  const hours = bucketSec / 3600;
+  return (
+    <div className="flex gap-[1px] h-3.5 min-w-[160px]" role="img" aria-label={label}>
+      {buckets.map((b) => {
+        const when = `${b.at.slice(5, 10)} ${b.at.slice(11, 16)}Z`;
+        return (
+          <div key={b.at} className={`flex-1 rounded-[2px] ${!b.recorded ? 'hatch' : ''}`}
+            style={{ background: b.atCapacity > 0 ? rampColor(b.atCapacity) : b.recorded ? '#1a2330' : undefined }}
+            {...bind(() => (<><div className="text-dim mb-0.5">{when} · {hours} hour{hours === 1 ? '' : 's'}</div>
+              {b.recorded ? <><TipRow value={`${Math.round(b.atCapacity * 100)}%`} label="of the time at capacity" /><TipRow value={b.avgRunning.toFixed(1)} label="jobs running on average" /></> : <div className="text-dim">not recorded yet</div>}</>))} />
+        );
+      })}
+    </div>
+  );
+}
+
+export function StripLegend({ low = 'idle', high = 'busy', hatched = 'no report' }) {
   return (
     <div className="flex items-center gap-3 text-[11px] text-dim">
-      <span className="flex items-center gap-1">idle <span className="inline-block w-3 h-2.5 rounded-[2px]" style={{ background: '#1a2330' }} />{SEQ.map((c) => <span key={c} className="inline-block w-3 h-2.5 rounded-[2px]" style={{ background: c }} />)} busy</span>
-      <span className="flex items-center gap-1"><span className="inline-block w-3 h-2.5 rounded-[2px] hatch" /> no report</span>
+      <span className="flex items-center gap-1">{low} <span className="inline-block w-3 h-2.5 rounded-[2px]" style={{ background: '#1a2330' }} />{SEQ.map((c) => <span key={c} className="inline-block w-3 h-2.5 rounded-[2px]" style={{ background: c }} />)} {high}</span>
+      <span className="flex items-center gap-1"><span className="inline-block w-3 h-2.5 rounded-[2px] hatch" /> {hatched}</span>
     </div>
   );
 }
