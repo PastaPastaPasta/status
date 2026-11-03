@@ -81,7 +81,8 @@ function cleanReport(b) {
   };
 }
 
-export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = null, log = () => {} }) {
+// runningJobs: runner name -> the job it runs now, from the org Actions queue (ci-queue.js).
+export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = null, runningJobs = () => new Map(), log = () => {} }) {
   const dir = join(dataDir, 'ci');
   const dirs = { hosts: join(dir, 'hosts'), jobs: join(dir, 'jobs') };
   for (const d of Object.values(dirs)) mkdirSync(d, { recursive: true });
@@ -302,19 +303,25 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
       return hours;
     };
     const runners = [], pools = [];
+    // Single-use runner names are never reused: a job whose end was missed matches no busy runner.
+    const runningOn = runningJobs();
     for (const h of hosts) {
       const stale = now - Date.parse(h.receivedAt) > STALE_MS;
       const hostLabel = regs[h.id]?.label || h.id;
       for (const r of h.runners || []) {
         const mine = jobs.filter((j) => j.host === h.id && (j.runnerName ? j.runnerName === r.name : j.runner === r.key));
+        const job = r.busy && !stale ? r.job : null;
         const busyIn = (a, b) => mine.reduce((s, j) => s + (j.end ? overlap(Date.parse(j.start), Date.parse(j.end), a, b) : 0), 0)
-          + (r.busy && r.job?.start && !stale ? overlap(Date.parse(r.job.start), now, a, b) : 0);
+          + (job?.start ? overlap(Date.parse(job.start), now, a, b) : 0);
         const status = stale ? 'offline' : r.error ? 'error' : !r.listening ? 'offline' : r.busy ? 'busy' : 'idle';
+        // The ledger only gets finished jobs: the running one counts, as a pool's running jobs do.
+        const day = dayStats(mine, busyIn);
+        if (job?.start && Date.parse(job.start) > now - DAY) day.jobs++;
         runners.push({
           host: h.id, hostLabel, hostname: h.host?.hostname, receivedAt: h.receivedAt, stale, status,
           name: r.name || r.key, pool: r.pool, kind: r.kind, container: r.container, version: r.version, error: r.error, containerState: r.containerState,
-          job: r.busy && !stale ? r.job : null, diag: r.diag,
-          day: dayStats(mine, busyIn),
+          job, diag: r.diag,
+          day,
           hours: hourStrip(h, busyIn, 1),
         });
       }
@@ -339,7 +346,9 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
           host: h.id, hostLabel, receivedAt: h.receivedAt, stale, status, name: p.name, controller: p.controller, backend: p.backend, labels: p.labels,
           // A drained pool is emptied on purpose; one that shrank still counts the runners it has.
           size, capacity: p.draining ? online + starting : Math.max(size, online + starting), online, idle, busy, starting, draining: p.draining, error: p.error,
-          running: stale ? [] : p.instances.filter((i) => i.state === 'busy').map((i) => ({ name: i.name, since: i.since })),
+          // Oldest first, each with its job once GitHub has said which runner took it.
+          running: stale ? [] : p.instances.filter((i) => i.state === 'busy').sort((a, b) => (a.since ? Date.parse(a.since) : Infinity) - (b.since ? Date.parse(b.since) : Infinity) || 0)
+            .map((i) => ({ name: i.name, since: i.since, job: runningOn.get(i.name) || null })),
           // Sampled jobs have no result: they add to the count only (unless the ledger has the unfinished job).
           day: { ...day, jobs: day.jobs + sampled.filter((v) => v.start > now - DAY && !inLedger.has(v.name)).length },
           hours: hourStrip(h, busyIn, size),
@@ -404,9 +413,12 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
   // private repositories are replaced or left out.
   function publicSummary() {
     const s = summary();
-    const privateRepos = new Set(allJobs().filter((j) => j.repo && j.visibility !== 'public').map((j) => j.repo));
+    // The ledger knows a repository once one of its jobs has finished; GitHub says so for running jobs.
+    const privateRepos = new Set([...allJobs().filter((j) => j.repo && j.visibility !== 'public'), ...[...runningJobs().values()].filter((j) => j.private)].map((j) => j.repo));
     const repo = (r) => (!r ? null : privateRepos.has(r) ? 'private repository' : r);
     const masked = (r, text) => (r && privateRepos.has(r) ? 'private workflow' : text);
+    const isPrivate = (j) => j.private || privateRepos.has(j.repo);
+    const shown = (j) => ({ name: j.name, repo: j.repo, workflow: j.workflow, start: j.start });
     const family = (os) => (/mac/i.test(os || '') ? 'macOS' : /ubuntu|debian|linux/i.test(os || '') ? 'Linux' : 'Runner');
     const hostLabel = new Map(), counts = {};
     for (const h of s.hosts) { const f = family(h.os); counts[f] = (counts[f] || 0) + 1; hostLabel.set(h.id, `${f} host ${counts[f]}`); }
@@ -423,9 +435,9 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
         load: h.load, memTotal: h.memTotal, memUsed: h.memUsed, uptimeSec: h.uptimeSec, disks: (h.disks || []).map((d) => ({ total: d.total, free: d.free })), docker: usage(h.docker) })),
       runners: s.runners.map((r) => ({ host: hostLabel.get(r.host), hostLabel: hostLabel.get(r.host), name: runnerOf(r.name), status: r.status, stale: r.stale, receivedAt: r.receivedAt,
         kind: r.kind, version: r.version, day: r.day, hours: r.hours,
-        job: r.job && { name: masked(r.job.repo, r.job.name), repo: repo(r.job.repo), workflow: masked(r.job.repo, r.job.workflow), start: r.job.start } })),
+        job: r.job && (isPrivate(r.job) ? { name: null, repo: 'private repository', workflow: 'private workflow', start: r.job.start } : shown(r.job)) })),
       pools: s.pools.map((p) => ({ host: hostLabel.get(p.host), hostLabel: hostLabel.get(p.host), name: p.name, status: p.status, stale: p.stale, receivedAt: p.receivedAt, backend: p.backend, labels: p.labels,
-        size: p.size, capacity: p.capacity, online: p.online, idle: p.idle, busy: p.busy, starting: p.starting, draining: p.draining, running: p.running.map((i) => ({ since: i.since })), day: p.day, hours: p.hours })),
+        size: p.size, capacity: p.capacity, online: p.online, idle: p.idle, busy: p.busy, starting: p.starting, draining: p.draining, running: p.running.map((i) => ({ since: i.since, job: i.job && !isPrivate(i.job) ? shown(i.job) : null })), day: p.day, hours: p.hours })),
       queue: s.queue && { at: s.queue.at, jobs: s.queue.jobs.filter((j) => !privateRepos.has(j.repo)).map((j) => ({ id: j.id, repo: j.repo, workflow: j.workflow, name: j.name, labels: j.labels, createdAt: j.createdAt })) },
       workflows: s.workflows.map((w) => ({ ...w, repo: repo(w.repo), workflow: masked(w.repo, w.workflow) })),
       daily: s.daily,

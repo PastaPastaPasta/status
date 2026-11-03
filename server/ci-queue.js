@@ -391,5 +391,9 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     return value;
   }
 
-  return { verify, webhook, tick, summary, capacity, flush, configured: () => !!secret };
+  // Runner name -> the job it runs now, for the runners page.
+  const runningJobs = () => new Map(Object.values(st.jobs).filter((j) => j.status === 'in_progress' && j.runner)
+    .map((j) => [j.runner, { repo: j.repo, private: j.private, runId: j.runId, workflow: j.workflow, name: j.name, start: j.startedAt, url: j.url }]));
+
+  return { verify, webhook, tick, summary, capacity, runningJobs, flush, configured: () => !!secret };
 }

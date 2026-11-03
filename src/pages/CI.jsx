@@ -7,6 +7,7 @@ import { SERIES, useTip } from '../viz.js';
 const STATUS = { busy: ['deploying', 'running a job'], idle: ['ok', 'idle'], offline: ['down', 'offline'], error: ['warn', 'reporter error'] };
 // A pool keeps `size` single-use runners ready; each takes one job and is replaced.
 const POOL_STATUS = { ok: ['ok', 'ready'], short: ['warn', 'below size'], draining: ['warn', 'draining'], offline: ['down', 'offline'], error: ['warn', 'reporter error'] };
+const POOL_JOBS_SHOWN = 4;
 const COMMON_LABELS = new Set(['self-hosted', 'Linux', 'X64', 'dash-ci-pool']);
 const RESULT = { Succeeded: 'lv-ok', Failed: 'lv-down', Canceled: 'text-dim', Abandoned: 'lv-warn' };
 const JOB_SERIES = [
@@ -157,17 +158,24 @@ function RunnerRow({ r, now, bind }) {
         <span className="text-dim mono text-[11px]">{r.kind === 'docker' ? (r.container ? `container ${r.container}` : 'in Docker') : 'native'}{r.version ? ` · v${r.version}` : ''}</span>
         <span className="ml-auto text-dim text-[11px]">24h: <span className="mono text-fg">{r.day.jobs}</span> jobs{r.day.failed ? <> · <span className="mono lv-down">{r.day.failed}</span> failed</> : null} · busy <span className="mono text-fg">{pct((r.day.busySec / 86400) * 100)}</span></span>
       </div>
-      {r.job && (
-        <div className="mt-1 text-[12px] flex gap-2 min-w-0">
-          <span className="text-dim shrink-0">running</span>
-          {r.job.repo && r.job.runId ? <a className="link truncate" href={`https://github.com/${r.job.repo}/actions/runs/${r.job.runId}`} target="_blank" rel="noreferrer">{r.job.repo} · {r.job.workflow ? `${r.job.workflow} · ` : ''}{r.job.name}</a> : <span className="truncate">{r.job.name}</span>}
-          <span className="mono text-dim shrink-0 ml-auto">{r.job.start ? `${ago(r.job.start, now)}` : ''}</span>
-        </div>
-      )}
+      {r.job && <JobLine job={r.job} start={r.job.start} now={now} />}
       {r.error && <div className="mt-1 text-[11.5px] lv-warn mono truncate" title={r.error}>{r.error}</div>}
       {r.containerState && r.containerState.status !== 'running' && <div className="mt-1 text-[11.5px] lv-down mono">container {r.containerState.status}</div>}
       <div className="mt-1.5"><HourStrip hours={r.hours} bind={bind} label={`${r.name}: busy time per hour, last 48 hours`} /></div>
       <div className="flex justify-between text-faint text-[10.5px] mono mt-0.5"><span>48h ago</span>{r.diag && <span className={diagWarn ? 'lv-warn' : ''} title="runner _diag logs">_diag {bytes(r.diag.bytes)} · {r.diag.files?.toLocaleString('en-US')} files</span>}<span>now</span></div>
+    </div>
+  );
+}
+
+// A running job, as its runner reports it or (for a pool's runner) as GitHub last listed it; null if neither has.
+function JobLine({ job, start, now }) {
+  const href = job?.url || (job?.repo && job.runId ? `https://github.com/${job.repo}/actions/runs/${job.runId}` : null);
+  const text = job ? [job.repo, job.workflow, job.name].filter(Boolean).join(' · ') : 'a job';
+  return (
+    <div className="mt-1 text-[12px] flex gap-2 min-w-0">
+      <span className="text-dim shrink-0">running</span>
+      {href ? <a className="link truncate" href={href} target="_blank" rel="noreferrer">{text}</a> : <span className={`truncate ${job ? '' : 'text-dim'}`}>{text}</span>}
+      <span className="mono text-dim shrink-0 ml-auto">{start ? ago(start, now) : ''}</span>
     </div>
   );
 }
@@ -186,8 +194,9 @@ function PoolRow({ p, now, bind }) {
       </div>
       <div className="mt-1 text-[12px] text-dim">
         <span className="mono text-fg">{p.online}</span>/{p.size} online: <span className="mono text-fg">{p.busy}</span> running a job · <span className="mono text-fg">{p.idle}</span> waiting{p.starting ? <> · <span className="mono text-fg">{p.starting}</span> starting</> : null}
-        {p.running.length > 0 && <span className="mono"> · oldest job {ago(p.running.reduce((a, i) => (!a || i.since < a ? i.since : a), null), now)}</span>}
       </div>
+      {p.running.slice(0, POOL_JOBS_SHOWN).map((i, n) => <JobLine key={i.name || `${i.since}|${n}`} job={i.job} start={i.since || i.job?.start} now={now} />)}
+      {p.running.length > POOL_JOBS_SHOWN && <div className="mt-1 text-[12px] text-dim">+{p.running.length - POOL_JOBS_SHOWN} more running</div>}
       {p.error && <div className="mt-1 text-[11.5px] lv-warn mono truncate" title={p.error}>{p.error}</div>}
       <div className="mt-1.5"><HourStrip hours={p.hours} bind={bind} label={`${p.name} pool: busy share of its ${p.size} runners per hour, last 48 hours`} /></div>
       <div className="flex justify-between text-faint text-[10.5px] mono mt-0.5"><span>48h ago</span><span>busy share of {p.size} runners</span><span>now</span></div>

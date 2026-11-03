@@ -35,7 +35,8 @@ export function createWeb({ dataDir, origin, auth: authDeps, fetcher = fetch, cl
   const auth = createAuth({ origin }, { store: join(dataDir, 'sessions.json'), ...authDeps });
   const clients = new Set();
   const cache = new Map();
-  const ci = createCi({ dataDir, fetcher, clock, github: ciGithub, log: (...a) => console.log(new Date(clock()).toISOString(), ...a) });
+  // Each module reads the other only when a request is served, so ci gets a late-bound runningJobs.
+  const ci = createCi({ dataDir, fetcher, clock, github: ciGithub, runningJobs: () => orgQueue.runningJobs(), log: (...a) => console.log(new Date(clock()).toISOString(), ...a) });
   const orgQueue = createOrgQueue({ dataDir, fetcher, clock, github: ciGithub, pools: ci.poolCapacity, ...ciQueue, log: (...a) => console.log(new Date(clock()).toISOString(), ...a) });
   const awsDir = join(dataDir, 'aws');
   mkdirSync(awsDir, { recursive: true });

@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCi } from './ci.js';
+import { createOrgQueue } from './ci-queue.js';
 
 const T0 = Date.parse('2026-09-29T12:00:00Z');
 const iso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -35,6 +36,7 @@ test('reporter tokens authenticate; reports are stored, deduplicated and summari
   const r = s.runners[0];
   assert.equal(r.status, 'busy');
   assert.equal(r.job.name, 'Rust tests');
+  assert.equal(r.day.jobs, 3); // the ledger's two finished jobs and the running one
   assert.equal(r.day.busySec, 75 * 60); // two 30-minute jobs + 15 minutes of the running one
   assert.equal(r.hours.length, 48);
   assert.equal(r.hours.at(-1).reported, true);
@@ -129,7 +131,7 @@ test('dash-ci-pool hosts: pools count as capacity, single-use runner jobs are ti
   assert.equal(s.runners.length, 0);
   const p = s.pools[0];
   assert.deepEqual([p.status, p.size, p.online, p.busy, p.idle, p.starting], ['ok', 4, 3, 1, 2, 1]);
-  assert.deepEqual(p.running, [{ name: 'r730-light-aaaaaa', since: iso(T0 - 60_000) }]);
+  assert.deepEqual(p.running, [{ name: 'r730-light-aaaaaa', since: iso(T0 - 60_000), job: null }]);
   ci.ingest(id, { ...report(), runners: [], pools: [{ ...pool, idle: 1, starting: 0 }] });
   assert.equal(ci.summary().pools[0].status, 'short');
   // Draining empties the pool on purpose: what is left is the capacity, not its size.
@@ -159,7 +161,7 @@ test('dash-ci-pool hosts: pools count as capacity, single-use runner jobs are ti
   const text = JSON.stringify(pub);
   for (const leak of ['r730', 'cccccc']) assert.ok(!text.includes(leak), `leaked ${leak}`);
   assert.equal(pub.pools[0].hostLabel, 'macOS host 1');
-  assert.deepEqual(pub.pools[0].running, [{ since: iso(T0 - 60_000) }]);
+  assert.deepEqual(pub.pools[0].running, [{ since: iso(T0 - 60_000), job: null }]);
   assert.equal(pub.recent[0].runnerName, 'macOS host 1 · light pool');
 
   // No report for four minutes: the pool is offline and none of it counts as online.
@@ -224,4 +226,47 @@ test('pools without a job ledger: busy time is sampled from the busy runners eac
   now += 50 * 3_600_000;
   send([]);
   assert.deepEqual(JSON.parse(readFileSync(join(dataDir, 'ci', 'hosts', `${id}.json`), 'utf8')).spans, {});
+});
+
+test('a pool lists the job each busy runner runs, from the org Actions queue, oldest first', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'ci-'));
+  const q = createOrgQueue({ dataDir, secret: 's', clock: () => T0 });
+  const ci = createCi({ dataDir, clock: () => T0, runningJobs: q.runningJobs });
+  const ghJob = (id, name, runner, repo, priv, status = 'in_progress') => q.webhook('workflow_job', { organization: { login: 'dashpay' }, repository: { full_name: repo, private: priv },
+    workflow_job: { id, run_id: 900 + id, run_attempt: 1, workflow_name: priv ? 'Deploy prod' : 'Tests', name, status, labels: ['self-hosted', 'dash-x64-build'], created_at: iso(T0 - 12 * 60_000),
+      started_at: iso(T0 - 9 * 60_000), runner_name: runner, runner_group_name: 'Default', head_branch: 'feat/x', html_url: `https://github.com/${repo}/actions/runs/${900 + id}/job/${id}` } });
+  ghJob(1, 'Rust workspace tests', 'r730-build-aaaaaa', 'dashpay/platform', false);
+  ghJob(2, 'ship it', 'r730-build-bbbbbb', 'dashpay/secret-infra', true);
+  ghJob(3, 'Lint', 'r730-build-dddddd', 'dashpay/platform', false);
+  ghJob(3, 'Lint', 'r730-build-dddddd', 'dashpay/platform', false, 'completed');
+  const { id } = ci.addReporter('r730');
+  const busy = (name, min) => ({ name, state: 'busy', since: min == null ? null : iso(T0 - min * 60_000) });
+  const build = { name: 'build', controller: 'r730', backend: 'qemu-vm', labels: ['self-hosted', 'dash-x64-build'], size: 4, idle: 0, busy: 4, starting: 0, draining: false, at: iso(T0),
+    instances: [busy('r730-build-eeeeee'), busy('r730-build-dddddd', 3), busy('r730-build-bbbbbb', 5), busy('r730-build-aaaaaa', 9), busy('r730-build-cccccc', 20)] };
+  // A runner running, for over a day, a job of a private repository the ledger has not seen finish.
+  const longJob = { name: 'ship it', start: iso(T0 - 25 * 3_600_000), repo: 'dashpay/secret-infra', runId: 7, workflow: 'Deploy prod' };
+  ci.ingest(id, { ...report([], { busy: true, job: longJob }), pools: [build] });
+
+  const running = ci.summary().pools[0].running;
+  assert.deepEqual(running.map((i) => i.name), ['r730-build-cccccc', 'r730-build-aaaaaa', 'r730-build-bbbbbb', 'r730-build-dddddd', 'r730-build-eeeeee']);
+  // Not (yet) known to GitHub, or its job already finished: listed without a job.
+  assert.deepEqual([running[0].job, running[3].job, running[4].job], [null, null, null]);
+  assert.deepEqual(running[1].job, { repo: 'dashpay/platform', private: false, runId: 901, workflow: 'Tests', name: 'Rust workspace tests', start: iso(T0 - 9 * 60_000), url: 'https://github.com/dashpay/platform/actions/runs/901/job/1' });
+  assert.equal(running[2].job.name, 'ship it');
+
+  const pub = ci.publicSummary();
+  assert.deepEqual(pub.pools[0].running, [
+    { since: iso(T0 - 20 * 60_000), job: null },
+    { since: iso(T0 - 9 * 60_000), job: { name: 'Rust workspace tests', repo: 'dashpay/platform', workflow: 'Tests', start: iso(T0 - 9 * 60_000) } },
+    // Signed out, when a private job runs stays private: the runner only reads as busy.
+    { since: iso(T0 - 5 * 60_000), job: null },
+    { since: iso(T0 - 3 * 60_000), job: null },
+    { since: null, job: null },
+  ]);
+  // The running job counts in the runner's day only if it started within it.
+  assert.equal(ci.summary().runners[0].day.jobs, 0);
+  // GitHub marks the repository private, so the runner's job is masked too.
+  assert.deepEqual(pub.runners[0].job, { name: null, repo: 'private repository', workflow: 'private workflow', start: longJob.start });
+  const text = JSON.stringify(pub);
+  for (const leak of ['r730', 'aaaaaa', 'github.com', 'secret-infra', 'ship it', 'Deploy prod', 'feat/x', 'Default']) assert.ok(!text.includes(leak), `leaked ${leak}`);
 });
