@@ -57,7 +57,7 @@ function cleanReport(b) {
   const docker = h.docker && typeof h.docker === 'object' && !h.docker.error
     ? Object.fromEntries(['images', 'containers', 'volumes', 'buildCache'].map((k) => [k, usage(h.docker[k])]))
     : h.docker?.error ? { error: str(h.docker.error) } : null;
-  const job = (j) => (j && typeof j === 'object' ? { name: str(j.name, 300), start: ts(j.start), repo: repoOf(j.repo), runId: int(j.runId), attempt: int(j.attempt) || 1, workflow: str(j.workflow), headRef: str(j.headRef), event: str(j.event, 40) } : null);
+  const job = (j) => (j && typeof j === 'object' ? { name: str(j.name, 300), start: ts(j.start), repo: repoOf(j.repo), runId: int(j.runId), attempt: int(j.attempt) || 1, workflow: str(j.workflow), headRef: str(j.headRef), event: str(j.event, 40), visibility: str(j.visibility, 20) } : null);
   return {
     reporter: str(b.reporter, 20), python: str(b.python, 20), at: ts(b.at),
     host: {
@@ -435,7 +435,7 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
         load: h.load, memTotal: h.memTotal, memUsed: h.memUsed, uptimeSec: h.uptimeSec, disks: (h.disks || []).map((d) => ({ total: d.total, free: d.free })), docker: usage(h.docker) })),
       runners: s.runners.map((r) => ({ host: hostLabel.get(r.host), hostLabel: hostLabel.get(r.host), name: runnerOf(r.name), status: r.status, stale: r.stale, receivedAt: r.receivedAt,
         kind: r.kind, version: r.version, day: r.day, hours: r.hours,
-        job: r.job && (isPrivate(r.job) ? { name: null, repo: 'private repository', workflow: 'private workflow', start: r.job.start } : shown(r.job)) })),
+        job: r.job && (isPrivate(r.job) || r.job.visibility !== 'public' ? { name: null, repo: 'private repository', workflow: 'private workflow', start: r.job.start } : shown(r.job)) })),
       pools: s.pools.map((p) => ({ host: hostLabel.get(p.host), hostLabel: hostLabel.get(p.host), name: p.name, status: p.status, stale: p.stale, receivedAt: p.receivedAt, backend: p.backend, labels: p.labels,
         size: p.size, capacity: p.capacity, online: p.online, idle: p.idle, busy: p.busy, starting: p.starting, draining: p.draining, running: p.running.map((i) => ({ since: i.since, job: i.job && !isPrivate(i.job) ? shown(i.job) : null })), day: p.day, hours: p.hours })),
       queue: s.queue && { at: s.queue.at, jobs: s.queue.jobs.filter((j) => !privateRepos.has(j.repo)).map((j) => ({ id: j.id, repo: j.repo, workflow: j.workflow, name: j.name, labels: j.labels, createdAt: j.createdAt })) },

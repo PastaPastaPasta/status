@@ -95,7 +95,7 @@ test('before sign-in: statistics without names, hosts, branches, links or privat
   ci.ingest(id, report([
     job(120, 30, { headRef: 'claude/strange-elbakyan', ref: 'refs/pull/5/merge' }),
     job(60, 20, { repo: 'dashpay/secret-infra', visibility: 'private', workflow: 'Deploy prod', name: 'ship it' }),
-  ], { busy: true, job: { name: 'Rust tests', start: iso(T0 - 15 * 60_000), repo: 'dashpay/platform', runId: 7, workflow: 'Tests', headRef: 'feat/x' } }));
+  ], { busy: true, job: { name: 'Rust tests', start: iso(T0 - 15 * 60_000), repo: 'dashpay/platform', runId: 7, workflow: 'Tests', headRef: 'feat/x', visibility: 'public' } }));
   const p = ci.publicSummary();
   const text = JSON.stringify(p);
   for (const leak of ['brian', 'mac-runner', '/Users/', 'actions-runner', 'claude/strange', 'refs/pull', 'secret-infra', 'Deploy prod', 'ship it', 'github.com', 'feat/x', 'platform-repositories'])
@@ -269,4 +269,22 @@ test('a pool lists the job each busy runner runs, from the org Actions queue, ol
   assert.deepEqual(pub.runners[0].job, { name: null, repo: 'private repository', workflow: 'private workflow', start: longJob.start });
   const text = JSON.stringify(pub);
   for (const leak of ['r730', 'aaaaaa', 'github.com', 'secret-infra', 'ship it', 'Deploy prod', 'feat/x', 'Default']) assert.ok(!text.includes(leak), `leaked ${leak}`);
+});
+
+test('signed out, a runner shows its running job only when the reporter says the repository is public', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'ci-'));
+  const ci = createCi({ dataDir, clock: () => T0 });
+  const start = iso(T0 - 4 * 60_000);
+  const shownFor = (visibility) => {
+    const { id } = ci.addReporter(`host-${visibility}`);
+    ci.ingest(id, report([], { busy: true, job: { name: 'ship it', start, repo: 'dashpay/secret-infra', runId: 8, workflow: 'Deploy prod', ...(visibility && { visibility }) } }));
+    const pub = ci.publicSummary();
+    ci.removeReporter(id);
+    return pub.runners[0].job;
+  };
+  // No ledger entry and no queue match: only the reporter's visibility can tell.
+  const masked = { name: null, repo: 'private repository', workflow: 'private workflow', start };
+  assert.deepEqual(shownFor('private'), masked);
+  assert.deepEqual(shownFor(undefined), masked);
+  assert.deepEqual(shownFor('public'), { name: 'ship it', repo: 'dashpay/secret-infra', workflow: 'Deploy prod', start });
 });
