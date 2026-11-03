@@ -137,10 +137,11 @@ test('dash-ci-pool hosts: pools count as capacity, single-use runner jobs are ti
   const drained = ci.summary();
   assert.deepEqual([drained.pools[0].status, drained.totals.runners, drained.totals.online], ['draining', 1, 1]);
   ci.ingest(id, { ...report(), runners: [], pools: [pool] });
-  assert.deepEqual([p.day.jobs, p.day.failed, p.day.busySec], [2, 1, 60]);
+  // Two ledger jobs of 30 s, plus the runner busy for the last minute.
+  assert.deepEqual([p.day.jobs, p.day.failed, p.day.busySec], [3, 1, 120]);
   // A second controller's light pool on the same reporter keeps its own jobs.
-  ci.ingest(id, { ...report(), runners: [], pools: [pool, { ...pool, controller: 'other' }] });
-  assert.deepEqual(ci.summary().pools.map((x) => x.day.jobs), [2, 0]);
+  ci.ingest(id, { ...report(), runners: [], pools: [pool, { ...pool, controller: 'other', instances: [] }] });
+  assert.deepEqual(ci.summary().pools.map((x) => x.day.jobs), [3, 0]);
   ci.ingest(id, { ...report(), runners: [], pools: [pool] });
   assert.equal(p.hours.length, 48);
   assert.deepEqual([s.totals.runners, s.totals.online, s.totals.busy, s.totals.jobs24h, s.totals.failed24h, s.totals.light24h], [4, 3, 1, 0, 0, 2]);
@@ -168,4 +169,59 @@ test('dash-ci-pool hosts: pools count as capacity, single-use runner jobs are ti
   later += 4 * 60_000;
   const off = stale.summary();
   assert.deepEqual([off.pools[0].status, off.pools[0].online, off.pools[0].running.length, off.totals.online], ['offline', 0, 0, 0]);
+});
+
+test('pools without a job ledger: busy time is sampled from the busy runners each report lists', () => {
+  let now = T0;
+  const dataDir = mkdtempSync(join(tmpdir(), 'ci-'));
+  const ci = createCi({ dataDir, clock: () => now });
+  const { id } = ci.addReporter('r730');
+  const busy = (name, sinceMs) => ({ name, state: 'busy', since: iso(sinceMs) });
+  const build = (instances) => ({ name: 'build', controller: 'r730', backend: 'qemu-vm', labels: ['self-hosted', 'dash-x64-build'], size: 2, idle: 2 - instances.length, busy: instances.length, starting: 0, draining: false, at: iso(now), instances });
+  const send = (instances, jobs = []) => ci.ingest(id, { ...report(jobs), at: iso(now), runners: [], pools: [build(instances)] });
+  // Busy since 30 minutes ago, still busy ten minutes later, then gone. Names
+  // from another controller, and a later `since` for a known runner, are ignored.
+  send([busy('r730-build-aaaaaa', T0 - 30 * 60_000), busy('other-build-ffffff', T0 - 30 * 60_000)]);
+  now += 10 * 60_000;
+  send([busy('r730-build-aaaaaa', T0 - 5 * 60_000), busy('r730-build-bbbbbb', now - 60_000)]);
+  now += 10 * 60_000;
+  send([busy('r730-build-bbbbbb', T0 + 9 * 60_000)]);
+  // aaaaaa: 40 min up to its last busy report; bbbbbb: 11 min and running.
+  let p = ci.summary().pools[0];
+  assert.deepEqual([p.day.jobs, p.day.failed, p.day.busySec], [2, 0, (40 + 11) * 60]);
+  now += 2 * 60_000; // a running job keeps counting until the report goes stale
+  assert.equal(ci.summary().pools[0].day.busySec, (40 + 13) * 60);
+  now += 2 * 60_000;
+  assert.equal(ci.summary().pools[0].day.busySec, (40 + 11) * 60);
+  now -= 2 * 60_000;
+  const hour = ci.summary().pools[0].hours.find((x) => x.hour === '2026-09-29T11:00Z');
+  assert.equal(hour.busy, 30 / 120); // 30 of its 2 runners' 120 minutes
+  assert.ok(ci.summary().totals.utilization24h > 0);
+  // Once the ledger has a runner's finished job, the job is used instead of its span,
+  // even while a report still lists the runner busy.
+  const ledgered = { runner: 'r730-build-bbbbbb', runnerName: 'r730-build-bbbbbb', name: 'build', start: iso(T0 + 9 * 60_000), end: iso(now - 60_000), result: 'Failed', pool: 'build' };
+  send([], [ledgered]);
+  send([busy('r730-build-bbbbbb', T0 + 9 * 60_000)]);
+  p = ci.summary().pools[0];
+  assert.deepEqual([p.day.jobs, p.day.failed, p.day.busySec], [2, 1, (40 + 12) * 60]);
+  assert.ok(!JSON.stringify(ci.publicSummary()).includes('aaaaaa'));
+  // A job stopped at its time limit has no end in the ledger: its span keeps the busy time.
+  now += 60_000;
+  send([busy('r730-build-cccccc', now - 10 * 60_000)]);
+  now += 60_000;
+  const abandoned = { runner: 'r730-build-cccccc', runnerName: 'r730-build-cccccc', name: 'build', start: iso(now - 11 * 60_000), end: null, result: 'Abandoned', pool: 'build' };
+  send([], [abandoned]);
+  p = ci.summary().pools[0];
+  assert.deepEqual([p.day.jobs, p.day.busySec], [3, (40 + 12 + 10) * 60]);
+  // A `since` ahead of the server's clock starts now; the host's clock skew is measured from its `at`.
+  // A job that started over 24 hours ago adds busy time but not to the day's count.
+  ci.ingest(id, { ...report(), at: iso(now - 60_000), runners: [], pools: [build([busy('r730-build-dddddd', now + 60 * 60_000), busy('r730-build-eeeeee', now - 3 * 60_000), busy('r730-build-gggggg', now - 25 * 3_600_000)])] });
+  const spans = JSON.parse(readFileSync(join(dataDir, 'ci', 'hosts', `${id}.json`), 'utf8')).spans;
+  assert.deepEqual([spans['r730-build-dddddd'].start, spans['r730-build-eeeeee'].start], [now, now - 2 * 60_000]);
+  assert.equal(ci.summary().pools[0].day.jobs, 3 + 2);
+  assert.equal(spans['other-build-ffffff'], undefined);
+  // Spans older than the 48-hour strip are dropped.
+  now += 50 * 3_600_000;
+  send([]);
+  assert.deepEqual(JSON.parse(readFileSync(join(dataDir, 'ci', 'hosts', `${id}.json`), 'utf8')).spans, {});
 });
