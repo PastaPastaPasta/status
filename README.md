@@ -177,6 +177,17 @@ older than GitHub allows in its state: queued 24 h, running 5 days, held 30 days
 which GitHub will never start, are listed separately so they can be cancelled. Signed out,
 the page shows public repositories only, without branches, links or runner names.
 
+**Capacity by runner labels** (same page, over 24 h, 7 days or 14 days) shows, per
+`runs-on` label set, how much runner time its jobs used and how long they ran
+(median, p90, longest), how many ran at once (time-weighted average, p95, peak,
+next to the runners our dash-ci-pool pools have now), and how often it was **at
+capacity**: the share of the time some job with those labels had already waited
+over a minute for a runner, so a job queued then would have waited too. The minute
+of grace leaves out a normal pickup (a hosted VM or a single-use runner starting).
+A strip shows when it happened, and selecting a row lists the jobs that used the
+most runner time. Jobs the sweep finds gone without a completion event are counted
+until halfway between when they were last seen and that sweep.
+
 - An org webhook keeps the page live. In the org settings, under Webhooks, set the
   payload URL to `https://status.testnet.networks.dash.org/api/ci/github-webhook`,
   the content type to `application/json`, and a random secret. Select only the
@@ -192,7 +203,9 @@ the page shows public repositories only, without branches, links or runner names
   while fewer than 1500 requests remain this hour, leaving the rest for the
   runner page.
 - State is kept in `data/ci/org-queue.json`: active jobs, finished jobs for 24 h,
-  and label sets served for 30 days. Set `CI_QUEUE_ORG` to change the
+  and label sets served for 30 days. Finished jobs for the capacity view are
+  appended to `data/ci/org-queue-history.jsonl` and kept for 14 days; on first
+  start it is seeded from the 24 h of finished jobs. Set `CI_QUEUE_ORG` to change the
   organisation (default `dashpay`).
 
 **AWS** (`/aws`) is an account-wide, read-only inventory collected by the agent

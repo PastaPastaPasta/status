@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createOrgQueue } from './ci-queue.js';
@@ -319,4 +319,101 @@ test('lost jobs leave the counts once GitHub would have ended them; holds stay',
   s = q.summary({ full: true });
   assert.deepEqual([s.totals.waiting, s.totals.running, s.totals.held], [0, 0, 1], 'no job runs longer than 5 days');
   assert.equal(s.held[0].stale, true);
+});
+
+test('capacity: finished jobs go to a history that survives a restart and feeds the per-label view', () => {
+  // Recording begins an hour before the jobs.
+  let now = T0 - 3_600_000;
+  const dataDir = dir();
+  const q = createOrgQueue({ dataDir, secret: 's', clock: () => now, pools: () => (labels) => (labels.includes('dash-x64-build') ? { runners: 10, online: 10, pools: 2 } : null) });
+  // Queued 10 min before T0, started 4 min before: waited 6 min, 5 of them past the grace minute.
+  q.webhook('workflow_job', event(job(1, 'queued')));
+  q.webhook('workflow_job', event(job(1, 'in_progress')));
+  q.webhook('workflow_job', event(job(1, 'completed', { completed_at: iso(T0) })));
+  // Cancelled while queued: GitHub gives it its creation time as started_at and no runner.
+  q.webhook('workflow_job', event(job(2, 'queued', { labels: ['dash-x64-build'] })));
+  q.webhook('workflow_job', event(job(2, 'completed', { labels: ['dash-x64-build'], conclusion: 'cancelled', started_at: iso(T0 - 10 * 60_000), completed_at: iso(T0 - 8 * 60_000), runner_name: '' })));
+  q.webhook('workflow_job', event(job(3, 'completed', { conclusion: 'skipped' })));
+  q.webhook('workflow_job', event(job(4, 'in_progress'), repo('dashpay/secret-hotfix', true)));
+  q.webhook('workflow_job', event(job(4, 'completed', { completed_at: iso(T0) }), repo('dashpay/secret-hotfix', true)));
+  q.flush();
+  now = T0 + 30 * 60_000;
+
+  const again = createOrgQueue({ dataDir, secret: 's', clock: () => now, pools: () => (labels) => (labels.includes('dash-x64-build') ? { runners: 10, online: 10, pools: 2 } : null) });
+  const full = again.capacity({ full: true, window: '24h' });
+  assert.equal(full.window, '24h');
+  const hosted = full.labels.find((g) => g.labels[0] === 'ubuntu-24.04');
+  assert.equal(hosted.jobs, 2, 'skipped jobs are left out');
+  assert.equal(hosted.runnerSec, 2 * 240);
+  assert.equal(hosted.medianRunSec, 240);
+  assert.equal(hosted.hosted, true);
+  assert.equal(hosted.capacity, null);
+  assert.deepEqual(hosted.topJobs.map((j) => j.repo).sort(), ['dashpay/dash', 'dashpay/secret-hotfix']);
+  const build = full.labels.find((g) => g.labels[0] === 'dash-x64-build');
+  assert.equal(build.runnerSec, 0, 'a job cancelled while queued never ran');
+  assert.ok(build.atCapacity > 0, 'but it waited 2 minutes');
+  assert.deepEqual(build.capacity, { runners: 10, online: 10, pools: 2 });
+
+  const pub = again.capacity({ window: '24h' });
+  assert.equal(pub.public, true);
+  assert.ok(!JSON.stringify(pub).includes('secret-hotfix'));
+  assert.equal(pub.labels.find((g) => g.labels[0] === 'ubuntu-24.04').jobs, 1);
+  assert.equal(again.capacity({ full: true, window: 'nope' }).window, '7d');
+});
+
+test('capacity: history starts from the last 24 h of finished jobs and drops lines past 14 days', () => {
+  let now = T0;
+  const dataDir = dir();
+  const q = createOrgQueue({ dataDir, secret: 's', clock: () => now });
+  q.webhook('workflow_job', event(job(1, 'completed', { completed_at: iso(T0) })));
+  q.flush();
+  // An install from before history existed: only org-queue.json is there.
+  rmSync(join(dataDir, 'ci', 'org-queue-history.jsonl'));
+  const seeded = createOrgQueue({ dataDir, secret: 's', clock: () => now });
+  assert.equal(seeded.capacity({ full: true, window: '24h' }).labels[0].jobs, 1);
+  now += 15 * 86_400_000;
+  seeded.webhook('workflow_job', event(job(2, 'completed', { created_at: iso(now - 60_000), started_at: iso(now - 30_000), completed_at: iso(now) })));
+  const lines = readFileSync(join(dataDir, 'ci', 'org-queue-history.jsonl'), 'utf8').trim().split('\n');
+  assert.deepEqual(lines.map((l) => JSON.parse(l).i), [2]);
+});
+
+test('capacity: a torn history line, a lost org-queue.json and a late redelivery do not lose or double jobs', () => {
+  let now = T0 - 3_600_000;
+  const dataDir = dir();
+  const history = join(dataDir, 'ci', 'org-queue-history.jsonl');
+  const q = createOrgQueue({ dataDir, secret: 's', clock: () => now });
+  q.webhook('workflow_job', event(job(1, 'completed', { completed_at: iso(T0) })));
+  q.flush();
+  writeFileSync(history, `${readFileSync(history, 'utf8')}{"i":2,"r":"dash`);
+  rmSync(join(dataDir, 'ci', 'org-queue.json'));
+  now = T0 + 60_000;
+  const again = createOrgQueue({ dataDir, secret: 's', clock: () => now });
+  again.webhook('workflow_job', event(job(3, 'completed', { completed_at: iso(T0 + 30_000) })));
+  // Redelivered after the 24 h list of finished jobs has forgotten it.
+  now = T0 + 2 * 86_400_000;
+  again.webhook('workflow_job', event(job(1, 'in_progress')));
+  assert.equal(again.summary({ full: true }).totals.running, 0);
+  now = T0 + 60_000;
+  const third = createOrgQueue({ dataDir, secret: 's', clock: () => now });
+  const g = third.capacity({ full: true, window: '24h' }).labels[0];
+  assert.equal(g.jobs, 2);
+  assert.equal(g.runnerSec, 240 + 270, 'recording is taken to have begun with the oldest job kept');
+});
+
+test('capacity: a job the sweep finds gone ran until halfway between its last sighting and the sweep', async () => {
+  let now = T0;
+  const headers = { 'x-ratelimit-remaining': '4100', 'x-ratelimit-reset': String(T0 / 1000 + 3600) };
+  const fetcher = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === '/orgs/dashpay/repos') return Response.json([{ full_name: 'dashpay/dash', private: false, archived: false, pushed_at: iso(T0) }], { headers });
+    return Response.json({ workflow_runs: [] }, { headers });
+  };
+  const q = createOrgQueue({ dataDir: dir(), secret: 's', github: { id: 'a', secret: 'b' }, fetcher, clock: () => now });
+  now = T0 + 60_000;
+  q.webhook('workflow_job', event(job(5, 'in_progress', { started_at: iso(T0 + 60_000) })));
+  now = T0 + 11 * 60_000;
+  await q.tick();
+  const g = q.capacity({ full: true, window: '24h' }).labels[0];
+  assert.equal(g.runnerSec, 300);
+  assert.equal(g.jobs, 1);
 });

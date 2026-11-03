@@ -5,11 +5,14 @@
 // existed, drops jobs whose completion was never delivered, and lists runs that
 // have been stuck for more than a day.
 //
-//   data/ci/org-queue.json   active jobs, last 24 h of finished jobs, label sets served
+//   data/ci/org-queue.json            active jobs, last 24 h of finished jobs, label sets served
+//   data/ci/org-queue-history.jsonl   finished jobs of the last 14 days, one per line (capacity view)
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { readJSON, writeAtomic } from '../shared/settings.js';
 import { median, pctile, str } from './ci.js';
+import { WINDOWS, capacityStats } from './ci-capacity.js';
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -33,6 +36,8 @@ const STALE_MS = 2 * HOUR;
 // queued 24 h, running 5 days (self-hosted), held for an approval 30 days.
 const MAX_AGE = { queued: 26 * HOUR, in_progress: 6 * DAY, held: 35 * DAY };
 const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+const HISTORY_MS = 14 * DAY;
+const CAPACITY_CACHE_MS = 60_000;
 
 const id = (v) => (Number.isSafeInteger(v) && v > 0 ? v : null);
 const time = (v) => (typeof v === 'string' && Number.isFinite(Date.parse(v)) ? new Date(v).toISOString().replace(/\.\d{3}Z$/, 'Z') : null);
@@ -53,8 +58,10 @@ function cleanJob(j, repo) {
   };
 }
 
-export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github = null, token = null, fetcher = fetch, clock = Date.now, log = () => {} }) {
+// pools() -> (labels) -> the runners our pools have now for a label set ({ runners, online, pools }), or null.
+export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github = null, token = null, fetcher = fetch, clock = Date.now, pools = () => () => null, log = () => {} }) {
   const path = join(dataDir, 'ci', 'org-queue.json');
+  const historyPath = join(dataDir, 'ci', 'org-queue-history.jsonl');
   // served: label set -> last start by any job (`all`) and by a public-repository job (`pub`).
   // since / lastEventAt have public twins so the signed-out view never shows when private jobs ran.
   const st = { jobs: {}, done: [], served: {}, stuck: [], since: null, publicSince: null, lastEventAt: null, lastPublicEventAt: null, sweep: null, rate: null, ...readJSON(path, {}) };
@@ -63,6 +70,60 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
   const flush = () => { clearTimeout(saveTimer); try { writeAtomic(path, JSON.stringify(st)); } catch (e) { log('ci queue save:', e.message); } };
   const save = () => { clearTimeout(saveTimer); saveTimer = setTimeout(flush, 1000); saveTimer.unref?.(); };
   const iso = () => new Date(clock()).toISOString();
+
+  // ---- history: finished jobs kept for the capacity view --------------------
+  // Compact lines: i id, r repo, p private, w workflow, n job name, l labels, q queued, s started,
+  // e completed (epoch ms), c conclusion, x ran on a runner.
+  const toLine = (d, ran) => ({ i: d.id, r: d.repo, p: d.private ? 1 : 0, w: d.workflow || null, n: d.name || null, l: d.labels,
+    q: d.queuedAt ? Date.parse(d.queuedAt) : null, s: d.startedAt ? Date.parse(d.startedAt) : null, e: Date.parse(d.completedAt), c: d.conclusion || null, x: ran ? 1 : 0 });
+  // The 24 h of finished jobs kept before history began have no runner name. GitHub gives a job
+  // cancelled while queued its creation time as started_at.
+  const ranOf = (d) => d.conclusion !== 'cancelled' || (!!d.startedAt && !!d.createdAt && d.startedAt > d.createdAt);
+  const intern = new Map();
+  const share = (v) => { if (typeof v !== 'string') return v; if (!intern.has(v)) intern.set(v, v); return intern.get(v); };
+  const shared = (h) => ({ ...h, r: share(h.r), w: share(h.w), n: share(h.n), l: h.l.map(share) });
+  const valid = (h) => id(h?.i) && typeof h.r === 'string' && Array.isArray(h.l) && Number.isFinite(h.e);
+  const rewrite = () => { try { writeAtomic(historyPath, history.map((h) => `${JSON.stringify(h)}\n`).join('')); } catch (e) { log('ci queue history write:', e.message); } };
+  let history = [];
+  if (existsSync(historyPath)) {
+    try {
+      const text = readFileSync(historyPath, 'utf8');
+      for (const line of text.split('\n')) {
+        if (!line) continue;
+        try { const h = JSON.parse(line); if (valid(h)) history.push(shared(h)); } catch { /* a torn last line */ }
+      }
+      // An append cut short by a crash would otherwise run into the next line.
+      if (text && !text.endsWith('\n')) rewrite();
+    } catch (e) { log('ci queue history read:', e.message); }
+    // Without org-queue.json, recording began no later than the oldest job kept.
+    if (!st.historySince && history.length) st.historySince = new Date(Math.min(...history.slice(0, 1000).map((h) => h.q ?? h.s ?? h.e))).toISOString();
+  } else {
+    // First start with history: the finished jobs kept for the last 24 h (at most 10,000) are the seed.
+    history = st.done.filter((d) => d.conclusion !== 'skipped' && d.completedAt).map((d) => shared(toLine(d, ranOf(d))));
+    const capped = st.done.length >= 10_000 ? Date.parse(st.done[0].completedAt) : 0;
+    st.historySince = new Date(Math.max(Date.parse(st.since || iso()), clock() - DAY, capped)).toISOString();
+    rewrite();
+    flush();
+  }
+  st.historySince ||= iso();
+  const inHistory = new Set(history.map((h) => h.i));
+  function record(d, ran) {
+    if (d.conclusion === 'skipped' || inHistory.has(d.id)) return;
+    const h = shared(toLine(d, ran));
+    if (!Number.isFinite(h.e)) return;
+    history.push(h);
+    inHistory.add(h.i);
+    try { appendFileSync(historyPath, `${JSON.stringify(h)}\n`); } catch (e) { log('ci queue history append:', e.message); }
+  }
+  // Old lines are dropped once an hour's worth has expired, by rewriting the file.
+  function pruneHistory() {
+    const cut = clock() - HISTORY_MS;
+    if (!history.length || history[0].e >= cut - HOUR) return;
+    history = history.filter((h) => h.e >= cut);
+    inHistory.clear();
+    for (const h of history) inHistory.add(h.i);
+    rewrite();
+  }
 
   function verify(raw, header) {
     if (!secret || !Buffer.isBuffer(raw) || typeof header !== 'string' || !header.startsWith('sha256=')) return false;
@@ -80,7 +141,7 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     const key = String(job.id);
     const prior = st.jobs[key];
     if (prior && RANK[prior.status] > RANK[job.status]) return false;
-    if (st.done.some((d) => d.id === job.id)) return false;
+    if (inHistory.has(job.id) || st.done.some((d) => d.id === job.id)) return false;
     const wasHeld = HELD.has(job.status) || !!prior?.wasHeld;
     const fromCreation = job.createdAt && job.startedAt && Date.parse(job.startedAt) - Date.parse(job.createdAt) <= DAY ? job.createdAt : null;
     const queuedAt = HELD.has(job.status) ? null
@@ -91,8 +152,11 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     }
     if (job.status === 'completed') {
       delete st.jobs[key];
-      st.done.push({ id: job.id, repo: job.repo, private: job.private, labels: job.labels, createdAt: job.createdAt || prior?.createdAt || null,
-        queuedAt, startedAt: job.startedAt || prior?.startedAt || null, completedAt: job.completedAt || seenAt, conclusion: job.conclusion });
+      const d = { id: job.id, repo: job.repo, private: job.private, labels: job.labels, createdAt: job.createdAt || prior?.createdAt || null,
+        queuedAt, startedAt: job.startedAt || prior?.startedAt || null, completedAt: job.completedAt || seenAt, conclusion: job.conclusion };
+      st.done.push(d);
+      // GitHub names the runner of every job that ran; one cancelled while queued has none.
+      record({ ...d, workflow: job.workflow || prior?.workflow, name: job.name !== '—' ? job.name : prior?.name }, !!(job.runner || prior?.runner) || prior?.status === 'in_progress');
     } else {
       st.jobs[key] = { ...prior, ...job, createdAt: job.createdAt || prior?.createdAt || seenAt, queuedAt, wasHeld, seenAt };
     }
@@ -103,6 +167,7 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     const now = clock();
     st.done = st.done.filter((d) => Date.parse(d.completedAt) > now - DAY).slice(-10_000);
     for (const [k, s] of Object.entries(st.served)) if (!s.all || Date.parse(s.all.at) < now - 30 * DAY) delete st.served[k];
+    pruneHistory();
   }
 
   // Who should hear that the queue changed: 'all', 'members' (a private job only) or false.
@@ -199,7 +264,12 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     }
     // A job the sweep could see but did not find has finished; its completion event was lost.
     for (const [k, j] of Object.entries(st.jobs)) {
-      if (covered.has(j.repo) && !seen.has(j.id) && !stuckRuns.has(j.runId) && Date.parse(j.seenAt) < started) delete st.jobs[k];
+      if (covered.has(j.repo) && !seen.has(j.id) && !stuckRuns.has(j.runId) && Date.parse(j.seenAt) < started) {
+        delete st.jobs[k];
+        // It ended between when it was last seen and this sweep: taken as halfway.
+        const ended = new Date((Date.parse(j.seenAt) + started) / 2).toISOString();
+        if (!HELD.has(j.status)) record({ ...j, completedAt: ended, conclusion: null, startedAt: j.status === 'in_progress' ? j.startedAt : null }, j.status === 'in_progress');
+      }
     }
     // Repositories the sweep could not list keep their earlier stuck runs for a while.
     const keepOld = (r) => !listed.has(r.repo) && (repos.has(r.repo) || tracked.has(r.repo)) && Date.parse(r.confirmedAt) > started - 2 * HOUR;
@@ -287,5 +357,39 @@ export function createOrgQueue({ dataDir, org = 'dashpay', secret = null, github
     };
   }
 
-  return { verify, webhook, tick, summary, flush, configured: () => !!secret };
+  // ---- capacity per label set ----------------------------------------------
+  // Signed out: public repositories only, like the queue. Computed at most once a minute per view.
+  const capacityCache = new Map();
+  function capacity({ full = false, window = '7d' } = {}) {
+    const w = Object.hasOwn(WINDOWS, window) ? window : '7d';
+    const now = clock();
+    const hit = capacityCache.get(`${full}|${w}`);
+    if (hit && now - hit.at < CAPACITY_CACHE_MS) return hit.value;
+    const { ms, bucketMs } = WINDOWS[w];
+    const recordedFrom = Math.max(Date.parse(st.historySince), full ? 0 : Date.parse(st.publicSince || st.historySince) || 0);
+    const windowFrom = now - ms, from = Math.min(now, Math.max(windowFrom, recordedFrom));
+    const stuckRuns = new Set(st.stuck.map((r) => r.runId));
+    const jobs = [];
+    for (const h of history) {
+      if (h.e < from || (!full && h.p)) continue;
+      jobs.push({ labels: h.l, repo: h.r, workflow: h.w, name: h.n, queuedAt: h.q, startedAt: h.s, endAt: h.e, ran: !!h.x, done: true });
+    }
+    for (const j of Object.values(st.jobs)) {
+      if ((!full && j.private) || HELD.has(j.status) || stuckRuns.has(j.runId)) continue;
+      // A job not heard of for a while may have finished unseen: it counts until it was last seen.
+      const seen = Date.parse(j.seenAt), running = j.status === 'in_progress';
+      jobs.push({ labels: j.labels, repo: j.repo, workflow: j.workflow, name: j.name, queuedAt: j.queuedAt ? Date.parse(j.queuedAt) : null,
+        startedAt: running && j.startedAt ? Date.parse(j.startedAt) : null, endAt: now - seen > STALE_MS ? seen : now, ran: running, done: false });
+    }
+    const hostedOf = (key, labels) => { const s = st.served[key]?.[full ? 'all' : 'pub']; return s ? s.hosted : hostedLabels(labels); };
+    let capacityOf = () => null;
+    try { capacityOf = pools(); } catch (e) { log('ci queue pools:', e.message); }
+    const poolOf = (labels) => (hostedLabels(labels) ? null : capacityOf(labels));
+    const value = { public: !full, at: new Date(now).toISOString(), window: w, windows: Object.keys(WINDOWS), recordedFrom: new Date(recordedFrom).toISOString(),
+      ...capacityStats({ jobs, from, to: now, windowFrom, bucketMs, hostedOf, capacityOf: poolOf }) };
+    capacityCache.set(`${full}|${w}`, { at: now, value });
+    return value;
+  }
+
+  return { verify, webhook, tick, summary, capacity, flush, configured: () => !!secret };
 }

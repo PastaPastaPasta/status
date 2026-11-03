@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { ago, clock, secs, useNow, useResource, useSession } from '../lib.js';
 import { Empty, Err, Section, Stat } from '../ui.jsx';
 import { CiTabs } from './CI.jsx';
+import QueueCapacity from './QueueCapacity.jsx';
 
 // Waiting longer than this for one label set means its runners are short or gone.
 const SLOW_SEC = 15 * 60;
@@ -78,6 +79,8 @@ export default function Queue() {
               {!data.labels.length && <div className="p-4 text-dim text-center">Nothing queued or running, and no jobs finished in the last 24 hours.</div>}
             </div>
           </Section>
+
+          <QueueCapacity as={session.user?.id || 'public'} now={now} />
 
           <Section title={`Waiting for a runner (${waiting.length}${filtered ? ` of ${data.waiting.length}` : ''})`} right={<Filters repos={repos} repo={repo} setRepo={setRepo} labels={labels} clear={() => { setRepo(''); setLabels(null); }} />}>
             <div className="panel overflow-x-auto max-h-[560px]">

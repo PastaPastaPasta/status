@@ -33,7 +33,7 @@ const sha256 = (s) => createHash('sha256').update(s).digest('hex');
 const repoOf = (v) => (typeof v === 'string' && REPO.test(v) && !v.split('/').some((p) => p === '.' || p === '..') ? v : null);
 export const median = (xs) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return s[Math.floor((s.length - 1) / 2)]; };
 export const pctile = (xs, p) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
-const overlap = (a0, a1, b0, b1) => Math.max(0, Math.min(a1, b1) - Math.max(a0, b0));
+export const overlap = (a0, a1, b0, b1) => Math.max(0, Math.min(a1, b1) - Math.max(a0, b0));
 // dash-ci-pool's light pool (dash-x64-light) runs seconds-long housekeeping jobs
 // (cache checks, labelers, PR policy): thousands a day that would drown the real
 // jobs, so job counts and the daily chart keep them apart.
@@ -435,5 +435,20 @@ export function createCi({ dataDir, fetcher = fetch, clock = Date.now, github = 
     };
   }
 
-  return { addReporter, removeReporter, authenticate, ingest, summary, publicSummary, tick, reporters };
+  // Runners our pools have now, as a lookup by runs-on label set: every pool whose labels include all
+  // of them (GitHub matches labels case-insensitively), counted as the pool rows count them. Null
+  // when no pool serves it.
+  function poolCapacity() {
+    const now = clock();
+    const pools = list(dirs.hosts).filter((h) => now - Date.parse(h.receivedAt) <= STALE_MS).flatMap((h) => h.pools || [])
+      .map((p) => ({ have: new Set((p.labels || []).map((l) => l.toLowerCase())), online: (p.idle || 0) + (p.busy || 0), starting: p.starting || 0, size: p.size || 0, draining: p.draining }));
+    return (labels) => {
+      const want = labels.map((l) => l.toLowerCase());
+      const mine = want.length ? pools.filter((p) => want.every((l) => p.have.has(l))) : [];
+      if (!mine.length) return null;
+      return { runners: mine.reduce((a, p) => a + (p.draining ? p.online + p.starting : Math.max(p.size, p.online + p.starting)), 0), online: mine.reduce((a, p) => a + p.online, 0), pools: mine.length };
+    };
+  }
+
+  return { addReporter, removeReporter, authenticate, ingest, summary, publicSummary, poolCapacity, tick, reporters };
 }
